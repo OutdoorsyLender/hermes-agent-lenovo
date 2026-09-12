@@ -93,6 +93,47 @@ const sessionScopeByRuntimeId = new Map<string, string>()
 // — while durable stored identity keeps outranking it (#97511).
 const sessionOwnerByRuntimeId = new Map<string, SessionOwnerScope>()
 
+// Runtime ownership is learned at gateway event fan-in, after a newly created
+// session can already have mounted consumers that attempted their initial RPC.
+// Publish only real owner changes so those consumers can retry once the event
+// producer proves the route without refetching on every streamed event.
+export const $sessionOwnerResolutionRevisionBySession = atom<Record<string, number>>({})
+
+function sameSessionOwner(left: SessionOwnerScope, right: SessionOwnerScope): boolean {
+  if (typeof left === 'string' || typeof right === 'string') {
+    return left === right
+  }
+
+  return left?.connectionId === right?.connectionId && left?.profile === right?.profile
+}
+
+function recordRuntimeSessionOwner(runtimeId: string, owner: Exclude<SessionOwnerScope, undefined>): void {
+  if (sameSessionOwner(sessionOwnerByRuntimeId.get(runtimeId), owner)) {
+    return
+  }
+
+  sessionOwnerByRuntimeId.set(runtimeId, owner)
+  const revisions = $sessionOwnerResolutionRevisionBySession.get()
+
+  $sessionOwnerResolutionRevisionBySession.set({
+    ...revisions,
+    [runtimeId]: (revisions[runtimeId] ?? 0) + 1
+  })
+}
+
+function forgetRuntimeSessionOwner(runtimeId: string): void {
+  sessionOwnerByRuntimeId.delete(runtimeId)
+
+  const revisions = $sessionOwnerResolutionRevisionBySession.get()
+
+  if (!(runtimeId in revisions)) {
+    return
+  }
+
+  const { [runtimeId]: _forgotten, ...rest } = revisions
+  $sessionOwnerResolutionRevisionBySession.set(rest)
+}
+
 export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
   if (!event.session_id) {
     return
@@ -100,7 +141,7 @@ export function recordSessionEventScope(event: { connectionId?: string; profile?
 
   if (event.connectionId) {
     sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
-    sessionOwnerByRuntimeId.set(event.session_id, {
+    recordRuntimeSessionOwner(event.session_id, {
       connectionId: event.connectionId,
       profile: String(event.profile ?? '').trim() || 'default'
     })
@@ -114,7 +155,7 @@ export function recordSessionEventScope(event: { connectionId?: string; profile?
   const profile = secondaryProfileOwnerForEvent(event as GatewayEvent)
 
   if (profile) {
-    sessionOwnerByRuntimeId.set(event.session_id, profile)
+    recordRuntimeSessionOwner(event.session_id, profile)
   }
 }
 
@@ -127,7 +168,7 @@ export function forgetProfileOnlyRuntimeOwners(profile: string): void {
 
   for (const [runtimeId, owner] of sessionOwnerByRuntimeId) {
     if (typeof owner === 'string' && normalizeProfileKey(owner) === retired) {
-      sessionOwnerByRuntimeId.delete(runtimeId)
+      forgetRuntimeSessionOwner(runtimeId)
     }
   }
 }
@@ -549,7 +590,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
-  sessionOwnerByRuntimeId.delete(runtimeId)
+  forgetRuntimeSessionOwner(runtimeId)
 
   const current = $sessionStates.get()
   setSessionStalled(current[runtimeId]?.storedSessionId, false)
@@ -577,6 +618,7 @@ export function clearAllSessionStates() {
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
   sessionOwnerByRuntimeId.clear()
+  $sessionOwnerResolutionRevisionBySession.set({})
   $stalledSessionIds.set([])
   $sessionStates.set({})
 }
