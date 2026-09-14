@@ -648,7 +648,9 @@ def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Opti
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
-            return "error", "tool_error", str(parsed_result.get("error"))
+            error_type = str(parsed_result.get("error_type") or "tool_error")
+            status = "blocked" if error_type.startswith("effect_policy_") else "error"
+            return status, error_type, str(parsed_result.get("error"))
     except Exception:
         pass
     try:
@@ -817,6 +819,33 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        # This is the innermost callback after request, execution, and
+        # pre-tool argument rewrites. Direct callers are authorized here; the
+        # agent executor supplies a one-shot permit bound to the same final
+        # arguments after authorizing at its corresponding seam.
+        from tools.effect_policy_runtime import consume_effect_permit
+
+        if consume_effect_permit(
+            function_name,
+            next_args,
+            task_id=ids.task_id,
+            tool_call_id=ids.tool_call_id,
+        ) is None:
+            from tools.effect_policy import PolicyDecision
+            from tools.effect_policy_runtime import effect_policy_block_message, enforce_tool_call
+
+            policy_result = enforce_tool_call(function_name, next_args, task_id=ids.task_id)
+            if policy_result.decision is not PolicyDecision.ALLOW:
+                error_type = (
+                    "effect_policy_denied"
+                    if policy_result.decision is PolicyDecision.DENY
+                    else "effect_policy_approval_required"
+                )
+                return tool_error(
+                    effect_policy_block_message(policy_result) or "Effect policy blocked this operation.",
+                    error_type=error_type,
+                    policy_decision=policy_result.decision.value,
+                )
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call

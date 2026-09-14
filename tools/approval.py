@@ -653,6 +653,19 @@ _ACTION_GATE = _GateSpec(
     ),
     smart_log="",
 )
+_EFFECT_GATE = _GateSpec(
+    noun="effect", transport=True, user_approved=False, redact_cli=True, pending_keys=True,
+    notify_failed="BLOCKED: Failed to send non-bypassable effect approval request to user. Do NOT retry.",
+    gateway_refused="BLOCKED: Effect {reason}.{reason_addendum}" + _STOP_ACTION + "{timeout_addendum}",
+    transport_denied=(
+        "BLOCKED: User denied this effect through the selected approval transport. "
+        "The user has NOT consented.{breaker}"
+    ),
+    cli_timeout="BLOCKED: Effect approval timed out without user response." + _STOP_ACTION
+                + " Silence is not consent.",
+    cli_denied="BLOCKED: User denied this effect ({description})." + _STOP_ACTION,
+    smart_log="",
+)
 
 
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
@@ -691,7 +704,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None,
+                    once_only: bool = False, require_present_human: bool = False,
+                    no_human_message: str = "") -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -709,7 +724,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    allow_permanent = permanent_capable and not smart_denied and not once_only
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -723,7 +738,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     def grant(choice: str) -> dict:
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        if not smart_denied and not once_only:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -733,7 +748,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=not smart_denied and not once_only, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -743,6 +758,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 _record_denial(session_key)
                 return deny(spec.transport_denied, "denied")
             return grant(choice)
+
+    if require_present_human and not (is_cli or is_gateway or is_ask):
+        return _blocked(
+            no_human_message or "BLOCKED: no interactive user or gateway can approve this effect.",
+            pattern_key=pattern_key,
+            description=description,
+        )
 
     # Gateway/async approval: block the agent thread until /approve or /deny, mirroring the CLI's synchronous input()
     # flow. The agent never sees "approval_required" here — it gets output or a definitive BLOCKED.
@@ -759,8 +781,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": permanent_capable and not smart_denied and not once_only,
+                "allow_session": not smart_denied and not once_only,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -803,8 +825,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command,
+        prompt_description,
+        allow_permanent=allow_permanent,
+        smart_denied=smart_denied,
+        approval_callback=approval_callback,
+        **({"allow_session": False} if once_only else {}),
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -958,7 +986,58 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_non_bypassable_effect_approval(
+    *,
+    description: str,
+    display_target: str,
+    pattern_key: str = "semantic_effect_policy",
+) -> dict:
+    """Ask for one correlated human decision without any policy bypass.
+
+    Selected approval transports retain their configured fail-closed fallback.
+    A delegated child's synthetic auto-approval callback is never accepted;
+    gateway and explicitly selected transports can still reach a real human.
+    """
+    session_key = get_current_session_key()
+    approval_callback, is_cli, is_gateway, is_ask = _presence()
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        if is_delegated_child_process_context():
+            approval_callback = None
+            is_cli = False
+    except Exception:
+        pass
+    return _human_decision(
+        _EFFECT_GATE,
+        command=display_target,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        warnings=[(pattern_key, None, False)],
+        session_key=session_key,
+        approval_callback=approval_callback,
+        is_cli=is_cli,
+        is_gateway=is_gateway,
+        is_ask=is_ask,
+        permanent_capable=False,
+        once_only=True,
+        require_present_human=True,
+        no_human_message=(
+            "BLOCKED: non-bypassable effect approval requires an interactive user, "
+            "gateway, or configured human approval transport."
+        ),
+    )
+
+
+def request_tool_approval(
+    tool_name: str,
+    reason: str,
+    *,
+    rule_key: str = "",
+    approval_callback=None,
+    display_target: str | None = None,
+) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -977,7 +1056,7 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         # Namespaced so plugin-rule approvals share the allowlist machinery without ever colliding with a real
         # command pattern key; the display target is a synthetic label for the display/allowlist layer.
         pattern_key=f"plugin_rule:{rule_key}", description=description,
-        display_target=f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
+        display_target=display_target or f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
         fail_closed_when_no_human=True,

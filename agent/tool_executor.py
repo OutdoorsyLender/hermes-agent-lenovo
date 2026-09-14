@@ -666,11 +666,63 @@ def _dispatch_authorized_once(
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
 
+    if block_message is None:
+        # Plugin hooks are allowed to rewrite arguments. Normalize their final
+        # payload before guardrails, semantic authorization, permit digesting,
+        # and dispatch so every downstream seam sees one identical operation.
+        from tools.arg_coercion import coerce_tool_args
+
+        ref.args = coerce_tool_args(ref.name, ref.args)
+        state.args = ref.args
+
     guardrail_decision = None
     if block_message is None:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
         if guardrail_decision.allows_execution:
             guardrail_decision = None
+
+    effect_permit = None
+    if block_message is None and guardrail_decision is None:
+        from tools.effect_policy import PolicyDecision
+        from tools.effect_policy_runtime import (
+            authorize_and_issue_effect_permit,
+            effect_policy_block_message,
+        )
+
+        def _authorize_effect():
+            from tools.approval_context import (
+                reset_current_observability_context,
+                set_current_observability_context,
+            )
+
+            ids = tool_hook_ids(agent, ref.task_id, ref.call_id)
+            tokens = set_current_observability_context(
+                turn_id=ids["turn_id"],
+                tool_call_id=ids["tool_call_id"],
+                session_id=ids["session_id"],
+            )
+            try:
+                return authorize_and_issue_effect_permit(
+                    ref.name,
+                    ref.args,
+                    task_id=ref.task_id,
+                    tool_call_id=ref.call_id,
+                )
+            finally:
+                reset_current_observability_context(tokens)
+
+        effect_result, effect_permit = (
+            _authorize_effect()
+            if authorization_gate is None
+            else authorization_gate.run(_authorize_effect)
+        )
+        if effect_result.decision is not PolicyDecision.ALLOW:
+            block_message = effect_policy_block_message(effect_result)
+            block_error_type = (
+                "effect_policy_denied"
+                if effect_result.decision is PolicyDecision.DENY
+                else "effect_policy_approval_required"
+            )
 
     if block_message is not None or guardrail_decision is not None:
         _advance_start_order()
@@ -680,13 +732,26 @@ def _dispatch_authorized_once(
             block_message=block_message, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
 
-    if ref.name == "memory":
-        agent._turns_since_memory = 0
-    elif ref.name == "skill_manage":
-        agent._iters_since_skill = 0
+    from tools.effect_policy_runtime import bind_issued_effect_permit, revoke_effect_permit
 
-    _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    try:
+        if ref.name == "memory":
+            agent._turns_since_memory = 0
+        elif ref.name == "skill_manage":
+            agent._iters_since_skill = 0
+
+        _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+
+        def _execute_with_permit():
+            with bind_issued_effect_permit(effect_permit):
+                return execute(ref.args)
+
+        return _run_with_activity_heartbeat(agent, ref.name, _execute_with_permit)
+    finally:
+        # Issuance precedes start-order/display/heartbeat setup. Every failure
+        # after issuance must release the registry record even if dispatch was
+        # never reached; normal consume/bind cleanup makes this idempotent.
+        revoke_effect_permit(effect_permit)
 
 
 def _run_agent_tool_execution_middleware(
