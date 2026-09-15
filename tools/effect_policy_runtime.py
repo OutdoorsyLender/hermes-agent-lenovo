@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Mapping, cast
 
 from tools.effect_policy import (
     CanonicalTarget,
+    EffectClassification,
     EffectKind,
     EffectPolicy,
     EffectRequest,
@@ -57,8 +58,16 @@ class _EffectPermitRecord:
     tool_name: str
     args_digest: str
     task_id: str
+    session_id: str
     tool_call_id: str | None
     authorization_fingerprint: str
+    normalized_action: str | None = None
+    classification: EffectClassification | None = None
+    mutability: Mutability | None = None
+    # Phase 2A binds computer-control authorization to the exact handler
+    # registration observed before policy/approval evaluation. Other migrated
+    # tools retain their Phase-1 binding until their own bounded phase.
+    registration_identity: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +118,30 @@ def _args_digest(args: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def snapshot_effect_args(args: dict) -> dict:
+    """Return an isolated, lossless JSON snapshot for authorization and execution."""
+    if not isinstance(args, dict):
+        raise TypeError("effect-policy arguments must be an object")
+    _validate_json_value(args)
+    encoded = json.dumps(
+        args,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    snapshot = json.loads(encoded)
+    if not isinstance(snapshot, dict):  # pragma: no cover - guarded by the input check
+        raise TypeError("effect-policy arguments must be an object")
+    return snapshot
+
+
 def _effective_task_id(task_id: str | None) -> str:
     return str(task_id or "default")
+
+
+def _effective_session_id(session_id: str | None) -> str:
+    return str(session_id or "")
 
 
 def _policy_fingerprint(policy: EffectPolicy) -> str:
@@ -167,11 +198,19 @@ def _authorization_fingerprint(policy: EffectPolicy, context: EffectContext) -> 
     return hashlib.sha256(encoded).hexdigest()
 
 
+def snapshot_effect_authorization() -> tuple[EffectPolicy, EffectContext, str]:
+    """Capture the live policy/context pair and its stable authorization identity."""
+    policy = load_effect_policy()
+    context = current_effect_context()
+    return policy, context, _authorization_fingerprint(policy, context)
+
+
 def authorize_and_issue_effect_permit(
     tool_name: str,
     args: dict,
     *,
     task_id: str | None = None,
+    session_id: str | None = None,
     tool_call_id: str | None = None,
 ) -> tuple[PolicyResult, _EffectPermitHandle | None]:
     """Enforce the live policy, then issue one registry-backed dispatch permit.
@@ -180,30 +219,110 @@ def authorize_and_issue_effect_permit(
     an empty policy. Unit-level policy injection remains on :func:`enforce_tool_call`,
     which never issues a permit.
     """
-    live_policy = load_effect_policy()
-    live_context = current_effect_context()
-    result = enforce_tool_call(
-        tool_name,
-        args,
-        task_id=_effective_task_id(task_id),
-        context=live_context,
-        policy=live_policy,
-    )
+    authorization_args = args
+    args_digest: str | None = None
+    normalized_action: str | None = None
+    classification: EffectClassification | None = None
+    mutability: Mutability | None = None
+    registration_identity = None
+    if tool_name == "computer_use":
+        try:
+            from tools.registry import registry
+
+            authorization_args = snapshot_effect_args(args)
+            args_digest = _args_digest(authorization_args)
+            normalized_action, classification, mutability = _computer_use_semantics(
+                authorization_args
+            )
+            registration_identity = registry.snapshot_dispatch_identity(tool_name)
+        except Exception as exc:
+            return PolicyResult(
+                PolicyDecision.DENY,
+                f"computer_use authorization snapshot failed: {exc}",
+                non_bypassable=True,
+            ), None
+        if registration_identity is None:
+            return PolicyResult(
+                PolicyDecision.DENY,
+                "computer_use registration is unavailable",
+                non_bypassable=True,
+            ), None
+
+    try:
+        live_policy = load_effect_policy()
+        live_context = current_effect_context()
+        result = enforce_tool_call(
+            tool_name,
+            authorization_args,
+            task_id=_effective_task_id(task_id),
+            context=live_context,
+            policy=live_policy,
+            approval_scope_id=(
+                registration_identity.approval_scope_key
+                if registration_identity is not None
+                else None
+            ),
+        )
+    except Exception as exc:
+        if tool_name != "computer_use":
+            raise
+        return PolicyResult(
+            PolicyDecision.DENY,
+            f"computer_use policy resolution failed: {exc}",
+            non_bypassable=True,
+        ), None
     if result.decision is not PolicyDecision.ALLOW:
         return result, None
-    try:
-        args_digest = _args_digest(args)
-    except (TypeError, ValueError):
-        # Re-authorize at the inner seam rather than trusting an incomplete or
-        # collision-prone identity for a non-JSON argument.
-        return result, None
+    if registration_identity is not None:
+        try:
+            final_live_fingerprint = _authorization_fingerprint(
+                load_effect_policy(), current_effect_context()
+            )
+            arguments_unchanged = (
+                _args_digest(authorization_args) == args_digest
+                and _args_digest(args) == args_digest
+            )
+        except Exception:
+            arguments_unchanged = False
+            final_live_fingerprint = ""
+        if not arguments_unchanged:
+            return PolicyResult(
+                PolicyDecision.DENY,
+                "computer_use arguments changed during authorization",
+                non_bypassable=True,
+            ), None
+        if final_live_fingerprint != _authorization_fingerprint(live_policy, live_context):
+            return PolicyResult(
+                PolicyDecision.DENY,
+                "computer_use policy or context changed during authorization",
+                non_bypassable=True,
+            ), None
+        if not registry.is_current_dispatch_identity(tool_name, registration_identity):
+            return PolicyResult(
+                PolicyDecision.DENY,
+                "computer_use registration changed during authorization",
+                non_bypassable=True,
+            ), None
+    elif args_digest is None:
+        try:
+            args_digest = _args_digest(args)
+        except (TypeError, ValueError):
+            # Re-authorize at the inner seam rather than trusting an incomplete
+            # or collision-prone identity for a non-JSON argument.
+            return result, None
+    assert args_digest is not None
     record = _EffectPermitRecord(
         attempt_id=uuid.uuid4().hex,
         tool_name=tool_name,
         args_digest=args_digest,
         task_id=_effective_task_id(task_id),
+        session_id=_effective_session_id(session_id),
         tool_call_id=tool_call_id,
         authorization_fingerprint=_authorization_fingerprint(live_policy, live_context),
+        normalized_action=normalized_action,
+        classification=classification,
+        mutability=mutability,
+        registration_identity=registration_identity,
     )
     with _effect_permits_lock:
         _effect_permits[record.attempt_id] = record
@@ -234,20 +353,32 @@ def consume_effect_permit(
     args: dict,
     *,
     task_id: str | None = None,
+    session_id: str | None = None,
     tool_call_id: str | None = None,
+    registration_identity: object | None = None,
 ) -> _EffectPermitRecord | None:
     """Atomically consume and validate an issuer-backed one-shot permit."""
     attempt_id = _current_effect_attempt.get()
     if not attempt_id:
         return None
-    _current_effect_attempt.set(None)
     try:
         args_digest = _args_digest(args)
     except (TypeError, ValueError):
-        with _effect_permits_lock:
-            _effect_permits.pop(attempt_id, None)
+        # Deactivate this binding, but leave the record for the owner to revoke:
+        # a mismatched operation must not consume its permit.
+        _current_effect_attempt.set(None)
         return None
     effective_task_id = _effective_task_id(task_id)
+    effective_session_id = _effective_session_id(session_id)
+    normalized_action: str | None = None
+    classification: EffectClassification | None = None
+    mutability: Mutability | None = None
+    if tool_name == "computer_use":
+        try:
+            normalized_action, classification, mutability = _computer_use_semantics(args)
+        except Exception:
+            _current_effect_attempt.set(None)
+            return None
     live_authorization_fingerprint = _authorization_fingerprint(
         load_effect_policy(),
         current_effect_context(),
@@ -260,11 +391,17 @@ def consume_effect_permit(
             or permit.tool_name != tool_name
             or permit.args_digest != args_digest
             or permit.task_id != effective_task_id
+            or permit.session_id != effective_session_id
             or permit.tool_call_id != tool_call_id
             or permit.authorization_fingerprint != live_authorization_fingerprint
+            or permit.normalized_action != normalized_action
+            or permit.classification != classification
+            or permit.mutability != mutability
+            or permit.registration_identity != registration_identity
         ):
-            _effect_permits.pop(attempt_id, None)
+            _current_effect_attempt.set(None)
             return None
+        _current_effect_attempt.set(None)
         return _effect_permits.pop(attempt_id)
 
 
@@ -574,6 +711,7 @@ def _request(
     mutability: Mutability,
     carrier: str,
     *,
+    classification: EffectClassification | None = None,
     target: CanonicalTarget | None = None,
     source: CanonicalTarget | None = None,
     destination: CanonicalTarget | None = None,
@@ -587,6 +725,7 @@ def _request(
         resource=resource,
         mutability=mutability,
         carrier=carrier,
+        classification=classification,
         target=target,
         source=source,
         destination=destination,
@@ -1010,6 +1149,49 @@ def _setup_mcp_requests(
     ]
 
 
+def _computer_use_semantics(
+    args: dict,
+) -> tuple[str, EffectClassification, Mutability]:
+    """Resolve the normalized action and authoritative core classification."""
+    raw_action = args.get("action")
+    if not isinstance(raw_action, str) or not (action := raw_action.strip().lower()):
+        raise ValueError("computer_use action must be a non-empty string")
+
+    from tools.computer_use.tool import _ACTIONS
+
+    spec = _ACTIONS.get(action)
+    if spec is None:
+        raise ValueError(f"unknown computer_use action: {action!r}")
+    if not isinstance(getattr(spec, "destructive", None), bool):
+        raise ValueError(f"computer_use action {action!r} has malformed destructive metadata")
+    if spec.destructive:
+        return (
+            action,
+            EffectClassification.PRIVILEGED_OR_SECURITY_SENSITIVE,
+            Mutability.MUTATING,
+        )
+    return action, EffectClassification.READ_ONLY_COMPATIBILITY, Mutability.READ_ONLY
+
+
+def _computer_use_requests(
+    tool_name: str, args: dict, context: EffectContext, resolver: TargetResolver
+) -> list[EffectRequest]:
+    """Classify the closed core action table; unknown metadata fails closed upstream."""
+    action, classification, mutability = _computer_use_semantics(args)
+    if mutability is Mutability.READ_ONLY:
+        return []
+    return [
+        _request(
+            context,
+            EffectKind.COMPUTER_CONTROL,
+            ResourceKind.COMPUTER,
+            mutability,
+            f"computer_use:{action}",
+            classification=classification,
+        )
+    ]
+
+
 _EFFECT_ADAPTERS: dict[str, Callable[[str, dict, EffectContext, TargetResolver], list[EffectRequest]]] = {
     "write_file": _write_file_requests,
     "patch": _patch_requests,
@@ -1019,6 +1201,7 @@ _EFFECT_ADAPTERS: dict[str, Callable[[str, dict, EffectContext, TargetResolver],
     "memory": _memory_requests,
     "skill_manage": _skill_requests,
     "setup_mcp": _setup_mcp_requests,
+    "computer_use": _computer_use_requests,
 }
 
 MIGRATED_TOOL_EFFECTS = frozenset(_EFFECT_ADAPTERS)
@@ -1052,6 +1235,22 @@ def authorize_tool_call(
     """Resolve and evaluate every semantic effect of a migrated tool call."""
     active_policy = policy or load_effect_policy()
     effective_context = context or current_effect_context()
+    classified_requests: list[EffectRequest] | None = None
+    if tool_name == "computer_use":
+        try:
+            classified_requests = effect_requests_for_tool(
+                tool_name,
+                args,
+                context=effective_context,
+                task_id=task_id,
+                target_resolver=target_resolver,
+            )
+        except Exception as exc:
+            return PolicyResult(
+                PolicyDecision.DENY,
+                f"computer_use classification failed: {exc}",
+                non_bypassable=True,
+            )
     process_action = str(args.get("action") or "").lower() if isinstance(args, dict) else ""
     opaque_semantic_carrier = (
         tool_name in {"terminal", "execute_code"}
@@ -1090,13 +1289,15 @@ def authorize_tool_call(
         and not active_policy.approval_required_effects
     ):
         return PolicyResult(PolicyDecision.ALLOW, "effect policy has no active rules")
-    requests = effect_requests_for_tool(
-        tool_name,
-        args,
-        context=effective_context,
-        task_id=task_id,
-        target_resolver=target_resolver,
-    )
+    requests = classified_requests
+    if requests is None:
+        requests = effect_requests_for_tool(
+            tool_name,
+            args,
+            context=effective_context,
+            task_id=task_id,
+            target_resolver=target_resolver,
+        )
     if not requests:
         return PolicyResult(PolicyDecision.ALLOW, "tool boundary has no migrated mutating effect")
     priority = {
@@ -1119,6 +1320,7 @@ def enforce_tool_call(
     policy: EffectPolicy | None = None,
     task_id: str | None = None,
     target_resolver: TargetResolver | None = None,
+    approval_scope_id: str | None = None,
 ) -> PolicyResult:
     """Evaluate a tool effect and resolve approval decisions without widening deny.
 
@@ -1172,11 +1374,24 @@ def enforce_tool_call(
         # Unsupported argument objects cannot share a persisted approval scope.
         scope_digest = uuid.uuid4().hex
     reason_digest = hashlib.sha256(result.reason.encode("utf-8")).hexdigest()[:12]
+    registration_scope = ""
+    if tool_name == "computer_use":
+        # Cached approval must not cross a same-name registration replacement.
+        # Calls outside the checked registry get a one-call random scope rather
+        # than a reusable approval with no registration identity.
+        bounded_scope = (
+            approval_scope_id
+            if isinstance(approval_scope_id, str) and approval_scope_id
+            else uuid.uuid4().hex
+        )
+        registration_scope = f":registration:{bounded_scope}"
 
     approval = request_tool_approval(
         tool_name,
         result.reason,
-        rule_key=f"effect_policy:{tool_name}:{reason_digest}:{scope_digest}",
+        rule_key=(
+            f"effect_policy:{tool_name}:{reason_digest}:{scope_digest}{registration_scope}"
+        ),
         display_target=display_details,
     )
     if approval.get("approved"):

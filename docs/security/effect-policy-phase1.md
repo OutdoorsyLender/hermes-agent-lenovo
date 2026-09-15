@@ -1,5 +1,8 @@
 # Effect policy phase 1
 
+> Phase 2A subsequently migrates destructive `computer_use` actions at the
+> final registry boundary. See [effect-policy-phase2a.md](effect-policy-phase2a.md).
+
 ## Decision-flow map
 
 Model-originated tool calls normally pass through request middleware, execution

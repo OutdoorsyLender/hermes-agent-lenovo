@@ -706,6 +706,7 @@ def _dispatch_authorized_once(
                     ref.name,
                     ref.args,
                     task_id=ref.task_id,
+                    session_id=ids["session_id"],
                     tool_call_id=ref.call_id,
                 )
             finally:

@@ -350,7 +350,8 @@ def _summarize_click(action: str, args: Dict[str, Any], fg: str) -> str:
     return f"{action}{where}{fg}"
 
 # One `action`. ``input``: native input to the backend's sticky target (gets delivery kwargs + the `app=` mismatch
-# guard). ``destructive``: mutates user-visible state -> approval prompt (the rest only read).
+# guard). ``destructive``: mutates user-visible state -> approval prompt. The remaining actions retain
+# compatibility behavior without claiming observational purity.
 # ``summarize(action, args, fg_suffix)`` renders the one-line approval prompt.
 _ActionSpec = namedtuple("_ActionSpec", "handler input destructive summarize",
                          defaults=(False, False, lambda a, args, fg: a + fg))

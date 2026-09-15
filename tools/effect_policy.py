@@ -62,6 +62,7 @@ class EffectKind(str, Enum):
     SKILL_CHANGE = "skill_change"
     MEMORY_CHANGE = "memory_change"
     MCP_CONFIGURATION_CHANGE = "mcp_configuration_change"
+    COMPUTER_CONTROL = "computer_control"
 
     # External systems.
     AWS_READ = "aws_read"
@@ -87,6 +88,7 @@ class ResourceKind(str, Enum):
     AWS = "aws"
     GITHUB = "github"
     NETWORK = "network"
+    COMPUTER = "computer"
     UNKNOWN = "unknown"
 
 
@@ -94,6 +96,13 @@ class Mutability(str, Enum):
     READ_ONLY = "read_only"
     MUTATING = "mutating"
     UNKNOWN = "unknown"
+
+
+class EffectClassification(str, Enum):
+    """Security classification attached to bounded semantic requests."""
+
+    PRIVILEGED_OR_SECURITY_SENSITIVE = "privileged_or_security_sensitive"
+    READ_ONLY_COMPATIBILITY = "read_only_compatibility"
 
 
 class IdentityStatus(str, Enum):
@@ -141,6 +150,7 @@ class EffectRequest:
     resource: ResourceKind
     mutability: Mutability
     carrier: str
+    classification: EffectClassification | None = None
     target: CanonicalTarget | None = None
     source: CanonicalTarget | None = None
     destination: CanonicalTarget | None = None

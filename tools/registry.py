@@ -7,12 +7,14 @@ model_tools."""
 
 import ast
 import functools
+import hashlib
 import importlib
 import json
 import logging
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
@@ -178,6 +180,37 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ToolDispatchIdentity:
+    """Immutable identity for one active registry slot at one generation."""
+
+    entry: ToolEntry
+    scope: Optional[str]
+    registration_generation: int
+    approval_scope_id: str
+    handler: Callable
+    is_async: bool
+
+    @property
+    def approval_scope_key(self) -> str:
+        """Opaque scope that changes with registration or handler identity."""
+        payload = (
+            f"{self.approval_scope_id}:{id(self.handler)}:{int(self.is_async)}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, ToolDispatchIdentity)
+            and self.entry is other.entry
+            and self.scope == other.scope
+            and self.registration_generation == other.registration_generation
+            and self.approval_scope_id == other.approval_scope_id
+            and self.handler is other.handler
+            and self.is_async is other.is_async
+        )
 
 
 class _PluginOverridePolicy:
@@ -383,6 +416,10 @@ class ToolRegistry:
         self._lock = threading.RLock()
         # Bumped on every mutation; get_tool_definitions memoizes against it.
         self._generation: int = 0
+        # Security-sensitive dispatch binds to one slot without treating an
+        # unrelated tool registration as replacement of this one.
+        self._registration_generations: Dict[tuple[Optional[str], str], int] = {}
+        self._registration_approval_scopes: Dict[tuple[Optional[str], str], str] = {}
 
     @staticmethod
     def current_scope_key() -> str:
@@ -440,6 +477,45 @@ class ToolRegistry:
         """Active profile's entry by name, falling back to global."""
         with self._lock:
             return self._merged_tools(scope).get(name)
+
+    def snapshot_dispatch_identity(
+        self, name: str, *, scope: Optional[str] = None
+    ) -> Optional[ToolDispatchIdentity]:
+        """Return the active entry, handler, and monotonic slot generation."""
+        with self._lock:
+            effective_scope = scope or self.current_scope_key()
+            scoped = self._scoped_tools.get(effective_scope, {})
+            slot_scope: Optional[str] = effective_scope if name in scoped else None
+            entry = scoped.get(name) if slot_scope is not None else self._tools.get(name)
+            if entry is None:
+                return None
+            slot_key = (slot_scope, name)
+            approval_scope_id = self._registration_approval_scopes.get(slot_key)
+            if approval_scope_id is None:
+                # Defensive support for legacy/tests that populate private
+                # maps directly; register() always creates this token.
+                approval_scope_id = uuid.uuid4().hex
+                self._registration_approval_scopes[slot_key] = approval_scope_id
+            return ToolDispatchIdentity(
+                entry=entry,
+                scope=slot_scope,
+                registration_generation=self._registration_generations.get(
+                    slot_key, 0
+                ),
+                approval_scope_id=approval_scope_id,
+                handler=entry.handler,
+                is_async=entry.is_async,
+            )
+
+    def is_current_dispatch_identity(
+        self,
+        name: str,
+        identity: ToolDispatchIdentity,
+        *,
+        scope: Optional[str] = None,
+    ) -> bool:
+        """Whether the active slot still exactly matches a captured identity."""
+        return self.snapshot_dispatch_identity(name, scope=scope) == identity
 
     def snapshot_registration(
         self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
@@ -659,6 +735,8 @@ class ToolRegistry:
             if scope is None and check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+            self._registration_generations[(scope, name)] = self._generation
+            self._registration_approval_scopes[(scope, name)] = uuid.uuid4().hex
 
     def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
         """Remove a tool; drops the toolset check/aliases if it was the last in its toolset.
@@ -715,6 +793,8 @@ class ToolRegistry:
                 self._toolset_checks.pop(entry.toolset, None)
                 self._drop_toolset_aliases(entry.toolset)
             self._generation += 1
+            self._registration_generations[(scope, name)] = self._generation
+            self._registration_approval_scopes[(scope, name)] = uuid.uuid4().hex
         logger.debug("Deregistered tool: %s", name)
 
     def restore_registration(
@@ -752,6 +832,8 @@ class ToolRegistry:
                 if not surviving and not any(e.toolset == toolset for e in in_overlays):
                     self._drop_toolset_aliases(toolset)
             self._generation += 1
+            self._registration_generations[(scope, name)] = self._generation
+            self._registration_approval_scopes[(scope, name)] = uuid.uuid4().hex
         logger.debug("Restored tool registration: %s", name)
         return True
 
@@ -810,16 +892,119 @@ class ToolRegistry:
     def dispatch(
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
-        results normalized, every exception returned as ``{"error": ...}``."""
-        entry = self.get_entry(name, scope=scope)
-        if not entry:
+        results normalized, every exception returned as ``{"error": ...}``.
+
+        Phase 2A makes this the checked boundary for ``computer_use`` so direct
+        registry and plugin dispatch cannot bypass semantic authorization.
+        """
+        dispatch_identity = self.snapshot_dispatch_identity(name, scope=scope)
+        if dispatch_identity is None:
             return tool_error(f"Unknown tool: {name}")
+        entry = dispatch_identity.entry
+        dispatch_args = args
+        if name == "computer_use":
+            try:
+                from tools.effect_policy import PolicyDecision
+                from tools.effect_policy_runtime import (
+                    _args_digest,
+                    consume_effect_permit,
+                    effect_policy_block_message,
+                    enforce_tool_call,
+                    snapshot_effect_args,
+                    snapshot_effect_authorization,
+                )
+
+                dispatch_args = snapshot_effect_args(args)
+                authorized_args_digest = _args_digest(dispatch_args)
+                permit = consume_effect_permit(
+                    name,
+                    dispatch_args,
+                    task_id=kwargs.get("task_id"),
+                    session_id=kwargs.get("session_id"),
+                    tool_call_id=kwargs.get("tool_call_id"),
+                    registration_identity=dispatch_identity,
+                )
+                if permit is None:
+                    live_policy, live_context, authorization_fingerprint = (
+                        snapshot_effect_authorization()
+                    )
+                    policy_result = enforce_tool_call(
+                        name,
+                        dispatch_args,
+                        task_id=kwargs.get("task_id"),
+                        context=live_context,
+                        policy=live_policy,
+                        approval_scope_id=dispatch_identity.approval_scope_key,
+                    )
+                    if policy_result.decision is not PolicyDecision.ALLOW:
+                        error_type = (
+                            "effect_policy_denied"
+                            if policy_result.decision is PolicyDecision.DENY
+                            else "effect_policy_approval_required"
+                        )
+                        return tool_error(
+                            effect_policy_block_message(policy_result)
+                            or "Effect policy blocked this operation.",
+                            error_type=error_type,
+                            policy_decision=policy_result.decision.value,
+                        )
+                    if _args_digest(dispatch_args) != authorized_args_digest:
+                        return tool_error(
+                            "Effect policy blocked computer_use because its arguments changed "
+                            "during authorization. Retry the operation.",
+                            error_type="effect_policy_arguments_changed",
+                        )
+                    _, _, current_fingerprint = snapshot_effect_authorization()
+                    if current_fingerprint != authorization_fingerprint:
+                        return tool_error(
+                            "Effect policy blocked computer_use because policy or context changed "
+                            "during authorization. Retry under the current policy.",
+                            error_type="effect_policy_stale_authorization",
+                        )
+                # Execute only the captured handler. Replacement, restoration,
+                # or in-place handler mutation after authorization invalidates
+                # the identity rather than switching implementations.
+                if not self.is_current_dispatch_identity(
+                    name, dispatch_identity, scope=scope
+                ):
+                    return tool_error(
+                        "Effect policy blocked computer_use because its registration changed "
+                        "during authorization. Retry to authorize the current registration.",
+                        error_type="effect_policy_registration_changed",
+                    )
+            except Exception as exc:
+                return tool_error(
+                    f"Effect policy DENIED: computer_use authorization failed: {exc}. "
+                    "The operation was not executed.",
+                    error_type="effect_policy_denied",
+                    policy_decision="deny",
+                )
         try:
-            if entry.is_async:
+            execution_handler = (
+                dispatch_identity.handler if name == "computer_use" else entry.handler
+            )
+            execution_is_async = (
+                dispatch_identity.is_async if name == "computer_use" else entry.is_async
+            )
+            if name == "computer_use":
+                # The successful identity check plus captured handler establishes
+                # the execution lease. Release the registry-wide lock before
+                # invoking tool code so unrelated dispatch and async overrides
+                # cannot block or deadlock on registry access.
+                with self._lock:
+                    if not self.is_current_dispatch_identity(
+                        name, dispatch_identity, scope=scope
+                    ):
+                        return tool_error(
+                            "Effect policy blocked computer_use because its registration changed "
+                            "before execution. Retry to authorize the current registration.",
+                            error_type="effect_policy_registration_changed",
+                        )
+            if execution_is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+                result = _run_async(execution_handler(dispatch_args, **kwargs))
             else:
-                result = entry.handler(args, **kwargs)
+                result = execution_handler(dispatch_args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

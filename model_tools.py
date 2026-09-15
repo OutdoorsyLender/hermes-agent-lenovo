@@ -825,10 +825,14 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         # arguments after authorizing at its corresponding seam.
         from tools.effect_policy_runtime import consume_effect_permit
 
-        if consume_effect_permit(
+        # ``computer_use`` defers consumption to ToolRegistry.dispatch, where
+        # the permit can be checked against the exact ToolEntry registration.
+        # That same boundary authorizes direct registry/plugin dispatches.
+        if function_name != "computer_use" and consume_effect_permit(
             function_name,
             next_args,
             task_id=ids.task_id,
+            session_id=ids.session_id,
             tool_call_id=ids.tool_call_id,
         ) is None:
             from tools.effect_policy import PolicyDecision
@@ -850,6 +854,8 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
             return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+        if function_name == "computer_use":
+            dispatch_kwargs["tool_call_id"] = ids.tool_call_id
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
