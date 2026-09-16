@@ -545,10 +545,13 @@ export function useGatewayBoot({
       }
     }
 
-    // Adopt the profile the primary (window) backend booted as, so same-profile
-    // resumes are no-op swaps and reconnects target the right backend.
-    // Best-effort: a missing preference means "default". Shared by boot + soft
-    // switch.
+    // Keep the primary socket pinned to the profile in its live descriptor.
+    // The persisted preference can change while the Python process survives a
+    // renderer reload; relabelling that socket as the new preference sends a
+    // resume to the wrong process, where the real owner is rejected as a live
+    // foreign writer. Activate the preference through the normal profile pool
+    // instead. Best-effort: a missing preference means "default". Shared by
+    // boot + soft switch.
     //
     // Helper windows (the HUD) can carry an explicit profile override in their
     // URL: the HUD is opened ON a conversation, and when that conversation
@@ -556,8 +559,12 @@ export function useGatewayBoot({
     // session id against the wrong backend — the HUD then falls back to the
     // default profile's last session (#82285). The override wins over the
     // stored preference; absent, behavior is unchanged.
-    async function adoptPrimaryProfile(shouldPublish: () => boolean = () => true): Promise<boolean> {
+    async function adoptPrimaryProfile(
+      connection: HermesConnection,
+      shouldPublish: () => boolean = () => true
+    ): Promise<boolean> {
       const override = windowProfileOverride()
+      let desiredProfile = normalizeProfileKey(override)
 
       try {
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
@@ -566,17 +573,17 @@ export function useGatewayBoot({
           return false
         }
 
-        const key = normalizeProfileKey(profileKey)
-        $activeGatewayProfile.set(key)
-        setPrimaryGateway(gateway, key)
-        void ensureGatewayForProfile(key)
+        desiredProfile = normalizeProfileKey(profileKey)
       } catch {
         if (!shouldPublish()) {
           return false
         }
-
-        $activeGatewayProfile.set(normalizeProfileKey(override))
       }
+
+      const primaryProfile = normalizeProfileKey(connection.profile || desiredProfile)
+
+      setPrimaryGateway(gateway, primaryProfile)
+      await ensureGatewayForProfile(desiredProfile)
 
       return true
     }
@@ -680,7 +687,7 @@ export function useGatewayBoot({
         // list rather than blanking the rail. NOT awaited: refreshProfiles
         // now carries a bounded retry chain (#70679), and switch completion
         // must not wait out backoff timers against an unhealthy backend.
-        if (!(await adoptPrimaryProfile(ownsSwitch)) || !ownsSwitch()) {
+        if (!(await adoptPrimaryProfile(conn, ownsSwitch)) || !ownsSwitch()) {
           return
         }
 
@@ -1144,7 +1151,7 @@ export function useGatewayBoot({
         // (cwd seed, config, sessions) are independent REST calls — running
         // them serially added their sum to time-to-populated-sidebar when only
         // the max is needed.
-        await adoptPrimaryProfile()
+        await adoptPrimaryProfile(conn)
 
         setDesktopBootStep({
           phase: 'renderer.config',

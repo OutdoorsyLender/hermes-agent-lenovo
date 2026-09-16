@@ -351,6 +351,41 @@ async function flushAsync() {
   })
 }
 
+describe('primary profile identity', () => {
+  it('keeps the socket on its launched profile when the persisted preference changed before a renderer reload', async () => {
+    const desktop = fakeDesktop()
+
+    const lifePrimary = {
+      ...primaryConn,
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'life',
+      wsUrl: 'ws://127.0.0.1:62531/api/ws?token=life'
+    }
+
+    const builderPool = {
+      ...coderConn,
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'builder',
+      wsUrl: 'ws://127.0.0.1:63686/api/ws?token=builder'
+    }
+
+    desktop.profile.get.mockResolvedValue({ profile: 'builder' })
+    desktop.getConnection.mockImplementation(async profile => (profile === 'builder' ? builderPool : lifePrimary))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+
+    expect(desktop.getConnection).toHaveBeenCalledWith(undefined)
+    expect(desktop.getConnection).toHaveBeenCalledWith('builder', { priority: 'foreground' })
+    expect(FakeWebSocket.instances).toHaveLength(2)
+  })
+})
+
 // Drive the exponential backoff forward by its full cap so the next scheduled
 // reconnect attempt actually runs (1s,2s,4s,8s,15s,15s…). Returns after the
 // attempt's async work settles.
