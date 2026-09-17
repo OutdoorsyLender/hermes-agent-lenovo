@@ -1,7 +1,7 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { DesktopConnectionsRegistry } from '@/global'
+import type { DesktopConnectionsRegistry, HermesConnection } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $desktopBoot } from '@/store/boot'
 import {
@@ -18,6 +18,7 @@ import {
   ensureGatewayForProfile,
   isActivePrimary,
   requestGatewayForAgent,
+  requestGatewayForProfile,
   retainGatewayForAgent
 } from '@/store/gateway'
 import { reconnectGateway } from '@/store/gateway-reconnect'
@@ -69,6 +70,10 @@ type Listener = (ev: unknown) => void
 let connectionApplied: null | (() => void) = null
 let powerResume: null | (() => void) = null
 
+const EXPECTED_STORED_SESSION_ID = '20260915_231100_79090b'
+const EXPECTED_BUILDER_RUNTIME_ID = '5fe31744'
+const WRONG_LIFE_RUNTIME_ID = 'life-runtime-79090b'
+
 describe('primaryRuntimeConnectionId', () => {
   it('uses the registry identity when the primary connection has one', () => {
     expect(primaryRuntimeConnectionId({ connectionId: ' tower ', mode: 'remote' })).toBe('tower')
@@ -98,6 +103,7 @@ class FakeWebSocket {
   // the JSON-RPC error a PRE-ping backend returns (a healthy, version-skewed
   // response that must NOT trigger a reconnect).
   static pingMode: 'pong' | 'silent' | 'method-not-found' = 'pong'
+  static rpcFrames: Array<{ method: string; params: Record<string, unknown>; url: string }> = []
 
   readyState = 0
   private listeners: Record<string, Set<Listener>> = {}
@@ -138,23 +144,23 @@ class FakeWebSocket {
   }
 
   send(data: string) {
-    let frame: { id?: unknown; method?: string }
+    let frame: { id?: unknown; method?: string; params?: Record<string, unknown> }
 
     try {
-      frame = JSON.parse(data) as { id?: unknown; method?: string }
+      frame = JSON.parse(data) as { id?: unknown; method?: string; params?: Record<string, unknown> }
     } catch {
       return
     }
 
-    if (frame.method !== 'ping') {
+    if (!frame.method) {
       return
     }
 
-    if (FakeWebSocket.pingMode === 'pong') {
+    if (frame.method === 'ping' && FakeWebSocket.pingMode === 'pong') {
       this.emit('message', {
         data: JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { pong: true } })
       })
-    } else if (FakeWebSocket.pingMode === 'method-not-found') {
+    } else if (frame.method === 'ping' && FakeWebSocket.pingMode === 'method-not-found') {
       this.emit('message', {
         data: JSON.stringify({
           jsonrpc: '2.0',
@@ -162,6 +168,47 @@ class FakeWebSocket {
           error: { code: -32601, message: 'Method not found' }
         })
       })
+    } else if (frame.method !== 'ping') {
+      const params = frame.params ?? {}
+      const backend = this.url.includes('63686') ? 'builder' : this.url.includes('62531') ? 'life' : 'other'
+
+      FakeWebSocket.rpcFrames.push({ method: frame.method, params, url: this.url })
+
+      if (frame.method === 'session.resume') {
+        const runtimeId = backend === 'builder' ? EXPECTED_BUILDER_RUNTIME_ID : WRONG_LIFE_RUNTIME_ID
+
+        this.emit('message', {
+          data: JSON.stringify({
+            jsonrpc: '2.0',
+            id: frame.id,
+            result: {
+              session_id: runtimeId,
+              stored_session_id: params.session_id
+            }
+          })
+        })
+      } else if (frame.method === 'prompt.submit') {
+        const runtimeId = String(params.session_id ?? '')
+        const storedId = runtimeId === EXPECTED_BUILDER_RUNTIME_ID ? EXPECTED_STORED_SESSION_ID : null
+
+        if (backend !== 'builder' || storedId !== EXPECTED_STORED_SESSION_ID) {
+          this.emit('message', {
+            data: JSON.stringify({
+              jsonrpc: '2.0',
+              id: frame.id,
+              error: {
+                code: 4090,
+                data: { reason: 'SESSION_NOT_OWNED' },
+                message: `Session ${EXPECTED_STORED_SESSION_ID} already has a live owner on builder`
+              }
+            })
+          })
+        } else {
+          this.emit('message', {
+            data: JSON.stringify({ jsonrpc: '2.0', id: frame.id, result: { accepted: true, session_id: runtimeId } })
+          })
+        }
+      }
     }
     // 'silent': swallow — a healthy socket answers, a half-open one never does.
   }
@@ -290,6 +337,7 @@ beforeEach(() => {
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
   FakeWebSocket.pingMode = 'pong'
+  FakeWebSocket.rpcFrames = []
   connectionApplied = null
   powerResume = null
   vi.mocked(notifyError).mockReset()
@@ -373,6 +421,7 @@ describe('primary profile identity', () => {
 
     desktop.profile.get.mockResolvedValue({ profile: 'builder' })
     desktop.getConnection.mockImplementation(async profile => (profile === 'builder' ? builderPool : lifePrimary))
+    desktop.getGatewayWsUrl.mockResolvedValueOnce(lifePrimary.wsUrl).mockResolvedValue(builderPool.wsUrl)
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
     render(<Harness />)
@@ -385,6 +434,71 @@ describe('primary profile identity', () => {
     expect(desktop.getConnection).toHaveBeenCalledWith(undefined)
     expect(desktop.getConnection).toHaveBeenCalledWith('builder', { priority: 'foreground' })
     expect(FakeWebSocket.instances).toHaveLength(2)
+  })
+
+  it('resumes and submits the same stored session through its pooled owner after reload profile drift', async () => {
+    const desktop = fakeDesktop()
+    const lifePrimary = {
+      ...primaryConn,
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'life',
+      wsUrl: 'ws://127.0.0.1:62531/api/ws?token=life'
+    }
+    const builderPool = {
+      ...coderConn,
+      connectionId: 'local',
+      mode: 'local' as const,
+      profile: 'builder',
+      wsUrl: 'ws://127.0.0.1:63686/api/ws?token=builder'
+    }
+
+    desktop.profile.get.mockResolvedValue({ profile: 'builder' })
+    desktop.getConnection.mockImplementation(async profile => (profile === 'builder' ? builderPool : lifePrimary))
+    desktop.getGatewayWsUrl.mockResolvedValueOnce(lifePrimary.wsUrl).mockResolvedValue(builderPool.wsUrl)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+    await vi.waitFor(() => expect($desktopBoot.get().phase).toBe('renderer.ready'))
+
+    const resumed = await requestGatewayForProfile<{ session_id: string; stored_session_id: string }>(
+      'builder',
+      'session.resume',
+      {
+        omit_messages: true,
+        session_id: EXPECTED_STORED_SESSION_ID,
+        source: 'desktop'
+      }
+    )
+
+    await expect(
+      requestGatewayForProfile('builder', 'prompt.submit', {
+        session_id: resumed?.session_id,
+        text: 'continue the existing session'
+      })
+    ).resolves.toEqual({ accepted: true, session_id: EXPECTED_BUILDER_RUNTIME_ID })
+
+    expect(FakeWebSocket.rpcFrames[0]?.url).toBe(builderPool.wsUrl)
+    expect(resumed).toEqual({ session_id: EXPECTED_BUILDER_RUNTIME_ID, stored_session_id: EXPECTED_STORED_SESSION_ID })
+    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect(FakeWebSocket.rpcFrames.map(frame => frame.method)).toEqual(['session.resume', 'prompt.submit'])
+    expect(FakeWebSocket.rpcFrames).toEqual([
+      {
+        method: 'session.resume',
+        params: { omit_messages: true, session_id: EXPECTED_STORED_SESSION_ID, source: 'desktop' },
+        url: builderPool.wsUrl
+      },
+      {
+        method: 'prompt.submit',
+        params: { session_id: EXPECTED_BUILDER_RUNTIME_ID, text: 'continue the existing session' },
+        url: builderPool.wsUrl
+      }
+    ])
+    expect(FakeWebSocket.rpcFrames.some(frame => frame.method === 'session.create')).toBe(false)
   })
 
 })
