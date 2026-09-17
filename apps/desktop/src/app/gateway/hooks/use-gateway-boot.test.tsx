@@ -379,11 +379,14 @@ describe('primary profile identity', () => {
     await flushAsync()
     await flushAsync()
     await flushAsync()
+    await flushAsync()
+    await vi.waitFor(() => expect($desktopBoot.get().phase).toBe('renderer.ready'))
 
     expect(desktop.getConnection).toHaveBeenCalledWith(undefined)
     expect(desktop.getConnection).toHaveBeenCalledWith('builder', { priority: 'foreground' })
     expect(FakeWebSocket.instances).toHaveLength(2)
   })
+
 })
 
 // Drive the exponential backoff forward by its full cap so the next scheduled
@@ -2185,5 +2188,46 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
       await vi.advanceTimersByTimeAsync(20_000)
     })
     expect($gatewayState.get()).toBe('open')
+  })
+})
+
+describe('shared primary profile identity', () => {
+  it('publishes the persisted request scope before refresh when the primary backend is shared', async () => {
+    const desktop = fakeDesktop()
+    const refreshScopes: Array<{ connection: null | HermesConnection; profile: string }> = []
+    const lifePrimary = {
+      ...remotePrimaryConn,
+      profile: 'life'
+    }
+    const builderScope = {
+      ...remotePrimaryConn,
+      profile: 'builder',
+      sharedPrimary: true
+    }
+
+    desktop.profile.get.mockResolvedValue({ profile: 'builder' })
+    desktop.getConnection.mockImplementation(async profile => (profile === 'builder' ? builderScope : lifePrimary))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    const recordRefreshScope = async () => {
+      refreshScopes.push({ connection: $connection.get(), profile: $activeGatewayProfile.get() })
+    }
+
+    render(<Harness refreshHermesConfig={recordRefreshScope} refreshSessions={recordRefreshScope} />)
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+    await vi.waitFor(() => expect($activeGatewayProfile.get()).toBe('builder'))
+
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(desktop.getConnection).toHaveBeenCalledWith(undefined)
+    expect(desktop.getConnection).toHaveBeenCalledWith('builder', { priority: 'foreground' })
+    expect($activeGatewayProfile.get()).toBe('builder')
+    expect($connection.get()).toMatchObject({ profile: 'builder', sharedPrimary: true })
+    expect(refreshScopes).toHaveLength(2)
+    expect(refreshScopes).toEqual(
+      refreshScopes.map(() => ({ connection: expect.objectContaining({ profile: 'builder', sharedPrimary: true }), profile: 'builder' }))
+    )
   })
 })

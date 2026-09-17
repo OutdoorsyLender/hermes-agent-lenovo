@@ -56,6 +56,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { loadPoolLimits } from '@/store/pool-limits'
 import {
   $activeGatewayProfile,
+  ensureGatewayProfile,
   normalizeProfileKey,
   refreshActiveProfile,
   touchActiveGatewayBackend
@@ -583,7 +584,13 @@ export function useGatewayBoot({
       const primaryProfile = normalizeProfileKey(connection.profile || desiredProfile)
 
       setPrimaryGateway(gateway, primaryProfile)
-      await ensureGatewayForProfile(desiredProfile)
+      if (desiredProfile === primaryProfile) {
+        await ensureGatewayForProfile(desiredProfile)
+      } else {
+        // The profile-level seam both activates a dedicated pool and publishes
+        // the sanctioned request-scope divergence for a shared primary.
+        await ensureGatewayProfile(desiredProfile)
+      }
 
       return true
     }
