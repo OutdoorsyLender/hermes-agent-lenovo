@@ -941,7 +941,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Durable retention policy set only by preservation-safe archival. Routine
+    -- GC must not remove this task's workspace or event history. Legacy rows
+    -- default to 0 and retain the existing GC policy.
+    preserve_from_gc     INTEGER NOT NULL DEFAULT 0
+                         CHECK (preserve_from_gc IN (0, 1)),
+    -- Durable half of the workspace-cleanup/archive handshake. Cleanup sets
+    -- this while holding the board write transaction before deleting bytes;
+    -- preservation-safe archival refuses rows whose cleanup already won.
+    workspace_cleaned    INTEGER NOT NULL DEFAULT 0
+                         CHECK (workspace_cleaned IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3491,7 +3501,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "    preserve_from_gc = 0 "
             "WHERE id = ? AND status != 'archived'", (task_id,),
         )
         if cur.rowcount != 1:
@@ -3861,12 +3872,14 @@ def task_age(task: Task) -> dict:
 # --- Retention + garbage collection ---
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion."""
+    """Prune old terminal-task events that are not under durable preservation."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived') "
+            "AND preserve_from_gc = 0)",
+            (cutoff,),
         )
     return int(cur.rowcount or 0)
 
@@ -4048,6 +4061,10 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_db_archive import (  # noqa: E402
+    archive_tasks_preservation_safe,
+    plan_preservation_safe_archive,
 )
 
 

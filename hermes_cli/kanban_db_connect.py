@@ -813,6 +813,16 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    (
+        "preserve_from_gc",
+        "preserve_from_gc INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (preserve_from_gc IN (0, 1))",
+    ),
+    (
+        "workspace_cleaned",
+        "workspace_cleaned INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (workspace_cleaned IN (0, 1))",
+    ),
 )
 
 _NOTIFY_SUB_COLUMNS = (

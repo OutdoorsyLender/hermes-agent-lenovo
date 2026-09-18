@@ -85,6 +85,52 @@ KANBAN_LIST_SCHEMA = _schema(
     [],
 )
 
+KANBAN_ARCHIVE_SCHEMA = _schema(
+    "kanban_archive",
+    (
+        "Preservation-safe archival for an explicitly reviewed task set. Always call "
+        "action='preflight' first, review the descendants-first task_ids and returned "
+        "dependency_token, then call action='commit' with that exact token. Commit is one "
+        "SQLite transaction and preserves task bodies, comments, prior events, runs, links, "
+        "attachments, notification subscriptions, attachment files, and workspaces. It refuses "
+        "running or protected tasks, non-terminal children outside the set, and any status/run/"
+        "dependency drift since preflight. Orchestrator-only: dispatcher-spawned task workers "
+        "never receive this cross-task mutation tool."
+    ),
+    {
+        "action": {
+            "type": "string",
+            "enum": ["preflight", "commit"],
+            "description": "Preflight returns the reviewed order/token; commit performs the bound transition.",
+        },
+        "task_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Complete explicit set to archive; never infer or omit descendants.",
+        },
+        "protected_task_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Explicit current/controlling tasks that must make the operation fail if selected.",
+        },
+        "expected_dependency_token": _prop(
+            "string", "Exact SHA-256 token returned by preflight; required for commit."
+        ),
+        "reason": _prop(
+            "string", "Required commit audit reason, such as SUPERSEDED_NO_EXECUTION."
+        ),
+        "superseded_by": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Replacement/controlling task ids recorded in every archive event; each must also "
+                "appear in protected_task_ids so preflight binds it as an excluded task."
+            ),
+        },
+    },
+    ["action", "task_ids", "protected_task_ids"],
+)
+
 KANBAN_COMPLETE_SCHEMA = _schema(
     "kanban_complete",
     (

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+from enum import Enum
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -29,7 +30,96 @@ _ACTIVE_CHILDREN_SQL = (
     "LIMIT 1"
 )
 
-_WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
+_WORKSPACE_ROW_SQL = (
+    "SELECT workspace_kind, workspace_path, branch_name, preserve_from_gc, "
+    "workspace_cleaned "
+    "FROM tasks WHERE id = ?"
+)
+
+
+class WorkspaceCleanupResult(Enum):
+    """Whether a worktree cleanup provably stopped before filesystem mutation."""
+
+    DECLINED_BEFORE_MUTATION = "declined_before_mutation"
+    MUTATION_MAY_HAVE_STARTED = "mutation_may_have_started"
+
+
+def _mark_workspace_cleanup_started(conn: sqlite3.Connection, task_id: str) -> None:
+    """Exclude a task from preservation-safe archival before deleting bytes."""
+    conn.execute(
+        "UPDATE tasks SET workspace_cleaned = 1 WHERE id = ?",
+        (task_id,),
+    )
+
+
+def _authorize_cleanup_under_write_lock(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    require_no_active_children: bool,
+) -> Optional[sqlite3.Row]:
+    """Commit-intent handshake for cleanup, serialized with safe archival."""
+    row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
+    if (
+        not row
+        or row["preserve_from_gc"]
+        or row["workspace_cleaned"]
+        or row["workspace_kind"] not in _REMOVABLE_KINDS
+        or not row["workspace_path"]
+        or (require_no_active_children and _has_active_children(conn, task_id))
+    ):
+        return None
+
+    kind = row["workspace_kind"]
+    path = row["workspace_path"]
+
+    wp = Path(path)
+    if kind == "scratch" and not _is_managed_scratch_path(wp):
+        _kb._log.warning(
+            "Refusing to remove out-of-scratch workspace for task %s: %s "
+            "(workspace_kind='scratch' but path is outside any "
+            "kanban-managed workspaces root)",
+            task_id, wp,
+        )
+        return None
+    # This marker commits BEFORE filesystem mutation. If deletion only partly
+    # succeeds, the process dies, or a later DB transaction fails, safe archival
+    # still cannot claim that the original workspace bytes survived.
+    _mark_workspace_cleanup_started(conn, task_id)
+    return row
+
+
+def _perform_authorized_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    row: sqlite3.Row,
+) -> bool:
+    """Perform a cleanup whose durable intent marker already committed."""
+    path = row["workspace_path"]
+    if row["workspace_kind"] == "worktree":
+        result = _cleanup_worktree_workspace(
+            task_id, path, row["branch_name"]
+        )
+        declined_before_mutation = (
+            result is WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
+        )
+        if declined_before_mutation:
+            # Safety predicates declined deletion. Re-open preservation only
+            # for a provably pre-mutation outcome.
+            with _kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET workspace_cleaned = 0 "
+                    "WHERE id = ? AND preserve_from_gc = 0",
+                    (task_id,),
+                )
+        # Unknown/legacy callback results fail closed: only the explicit
+        # pre-mutation state is sufficient proof to reopen preservation.
+        return not declined_before_mutation
+
+    wp = Path(path)
+    shutil.rmtree(wp, ignore_errors=True)
+    _kb._log.debug("Removed scratch workspace: %s", wp)
+    return True
 
 
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
@@ -115,56 +205,30 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` and preservation-safe archives are
+    intentionally preserved."""
     try:
-        row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind not in _REMOVABLE_KINDS or not path:
-            # Not removable itself, but completing may still unblock a deferred
-            # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
-            # See #33774.
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
-            _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
-                kind, task_id, path,
+        with _kb.write_txn(conn):
+            row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
+            kind: Optional[str] = row["workspace_kind"] if row else None
+            path: Optional[str] = row["workspace_path"] if row else None
+            authorized = _authorize_cleanup_under_write_lock(
+                conn,
+                task_id,
+                require_no_active_children=True,
             )
-            return
-        # Kill the (dead) tmux worker session BEFORE removing a worktree so a
-        # lingering worker never has its cwd deleted from under it.
-        if kind == "worktree":
-            _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+        if kind not in _REMOVABLE_KINDS or not path:
+            # A non-removable child may still unblock a deferred parent.
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard: a board's ``default_workdir`` can pair
-            # ``workspace_kind='scratch'`` with a user path pointing at a real
-            # source tree; without this, completion would rmtree the user's data.
-            # See #28818.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _kb._log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
-        # Kill the owning worker's tmux session if it is now dead, then let any
-        # parent whose children are all done run its deferred cleanup.
+        if authorized is None:
+            return
+        attempted = _perform_authorized_cleanup(conn, task_id, authorized)
+        if not attempted:
+            return
+        # Cleanup intent committed before filesystem deletion. Tmux and
+        # recursive parent cleanup remain best-effort post-commit effects.
         _cleanup_worker_tmux(conn, task_id)
-        # After cleaning up this task's workspace, check if any parent tasks now have all children done —
-        # their deferred cleanup can proceed (#33774).
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
@@ -172,7 +236,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
-) -> None:
+) -> WorkspaceCleanupResult:
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
@@ -182,44 +246,54 @@ def _cleanup_worktree_workspace(
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
     except Exception:
-        return  # CLI safety predicates unavailable — preserve
+        return WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
+    remove_started = False
     try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
-            return
+            return WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
+            return WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
-            return  # never remove the main checkout
+            return WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
             )
-            return
+            return WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
+        # Once the subprocess is invoked, a nonzero exit does not prove that it
+        # left every worktree byte and git metadata untouched.
+        remove_started = True
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
             _kb._log.warning(
                 "git worktree remove failed for task %s at %s: %s",
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
-            return
+            return WorkspaceCleanupResult.MUTATION_MAY_HAVE_STARTED
         _kb._log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
             _git(repo_root, "branch", "-D", branch, timeout=30)
+        return WorkspaceCleanupResult.MUTATION_MAY_HAVE_STARTED
     except Exception:
-        pass  # best-effort — never block completion
+        return (
+            WorkspaceCleanupResult.MUTATION_MAY_HAVE_STARTED
+            if remove_started
+            else WorkspaceCleanupResult.DECLINED_BEFORE_MUTATION
+        )
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
     """Run the deferred cleanup of any parent scratch/worktree workspace whose
     children are now all done/archived/failed/cancelled (called after each
-    child completes).
+    child completes). Parents marked for preservation-safe archival are never
+    cleanup candidates.
 
     See #33774.
     """
@@ -229,21 +303,21 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
-            if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or _has_active_children(conn, parent_id)
-            ):
+            with _kb.write_txn(conn):
+                authorized = _authorize_cleanup_under_write_lock(
+                    conn,
+                    parent_id,
+                    require_no_active_children=True,
+                )
+            if authorized is None:
                 continue
-            if row["workspace_kind"] == "worktree":
-                _cleanup_worktree_workspace(parent_id, row["workspace_path"], row["branch_name"])
-                continue
-            wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+            kind = authorized["workspace_kind"]
+            attempted = _perform_authorized_cleanup(conn, parent_id, authorized)
+            if attempted and kind == "scratch":
+                _kb._log.debug(
+                    "Deferred cleanup: removed parent %s scratch workspace",
+                    parent_id,
+                )
     except Exception:
         pass  # best-effort
 
@@ -537,7 +611,25 @@ def _set_task_column(conn: sqlite3.Connection, task_id: str, column: str, value:
 
 
 def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str) -> None:
-    _set_task_column(conn, task_id, "workspace_path", str(path))
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT preserve_from_gc, workspace_cleaned FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task: {task_id}")
+        if row["workspace_cleaned"]:
+            raise RuntimeError(
+                f"cannot set workspace path for {task_id}: workspace cleanup already started"
+            )
+        if row["preserve_from_gc"]:
+            raise RuntimeError(
+                f"cannot set workspace path for {task_id}: workspace is preservation-protected"
+            )
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(path), task_id),
+        )
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:

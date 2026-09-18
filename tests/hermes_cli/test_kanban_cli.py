@@ -72,6 +72,43 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_archive_preservation_safe_cli_preflights_then_commits(kanban_home, monkeypatch):
+    with kbc.connect_closing() as conn:
+        root = kb.create_task(conn, title="superseded root")
+        child = kb.create_task(conn, title="stranded child", parents=[root])
+        protected = kb.create_task(conn, title="current replacement")
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id IN (?, ?)", (root, child))
+        conn.commit()
+
+    rejected = kc.run_slash(f"archive --protect {protected} {root} {child}")
+    assert "--safe" in rejected
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, root).status == "blocked"
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", protected)
+    rejected = kc.run_slash(
+        f"archive --safe preflight --protect {protected} {root} {child}"
+    )
+    assert "orchestrator-only" in rejected
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+
+    plan = json.loads(kc.run_slash(
+        f"archive --safe preflight --protect {protected} --json {root} {child}"
+    ))
+    assert plan["task_ids"] == [child, root]
+    result = json.loads(kc.run_slash(
+        "archive --safe commit "
+        f"--protect {protected} --superseded-by {protected} "
+        f"--reason SUPERSEDED_NO_EXECUTION --expected-token {plan['dependency_token']} "
+        f"--json {' '.join(plan['task_ids'])}"
+    ))
+    assert result == {
+        "archived_task_ids": [child, root],
+        "count": 2,
+        "workspace_preserved": True,
+    }
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

@@ -1043,14 +1043,70 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
+    safe_action = getattr(args, "safe", None)
+    if safe_action and os.environ.get("HERMES_KANBAN_TASK"):
+        return _err(
+            "preservation-safe archive is orchestrator-only; "
+            "workers must hand off their assigned task"
+        )
+    protected = list(getattr(args, "protected_task_ids", None) or [])
+    superseded_by = list(getattr(args, "superseded_by", None) or [])
+    safe_only_supplied = any((
+        protected,
+        superseded_by,
+        getattr(args, "expected_token", None),
+        getattr(args, "reason", None),
+    ))
+    if safe_only_supplied and not safe_action:
+        return _err("--protect, --superseded-by, --expected-token, and --reason require --safe")
     if ids and purge_ids:
         return _err("choose either task_ids to archive or --rm archived task_ids")
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
     with kbc.connect_closing() as conn:
         if purge_ids:
+            if safe_action:
+                return _err("--safe cannot be combined with --rm")
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
+        if safe_action:
+            if safe_action == "preflight":
+                plan = kb.plan_preservation_safe_archive(
+                    conn, ids, protected_task_ids=protected)
+                plan["workspace_preserved"] = True
+                if _json_out(args, plan):
+                    return 0
+                print("Preservation-safe archive preflight:")
+                for task_id in plan["task_ids"]:
+                    print(f"  {task_id}")
+                print(f"dependency token: {plan['dependency_token']}")
+                print("No tasks changed; re-run with --safe commit and --expected-token.")
+                return 0
+            reason = str(getattr(args, "reason", None) or "").strip()
+            token = str(getattr(args, "expected_token", None) or "").strip()
+            if not reason:
+                return _err("--reason is required with --safe commit")
+            if not token:
+                return _err("--expected-token from --safe preflight is required with --safe commit")
+            archived = kb.archive_tasks_preservation_safe(
+                conn,
+                ids,
+                reason=reason,
+                superseded_by=superseded_by,
+                protected_task_ids=protected,
+                expected_dependency_token=token,
+            )
+            result = {
+                "archived_task_ids": archived,
+                "count": len(archived),
+                "workspace_preserved": True,
+            }
+            if _json_out(args, result):
+                return 0
+            print("Archived atomically (workspaces and evidence preserved):")
+            for task_id in archived:
+                print(f"  {task_id}")
+            return 0
         return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 

@@ -66,7 +66,12 @@ def test_saved_opt_in_roundtrip_reaches_schema_and_board(surface, tmp_path, monk
     try:
         toggle(True)
         enabled_names = _names(selected())
-        assert {"kanban_list", "kanban_create", "kanban_complete"} <= enabled_names
+        assert {
+            "kanban_list",
+            "kanban_archive",
+            "kanban_create",
+            "kanban_complete",
+        } <= enabled_names
         assert not _names(selected("telegram")), "CLI opt-in leaked to Telegram"
         assert "file" in selected()
         # A second profile in the same process must not borrow this grant or
@@ -129,6 +134,7 @@ def test_selection_is_scoped_and_preserves_worker_and_deny_boundaries(legacy, tm
     worker = _names(["file"])
     assert "kanban_complete" in worker
     assert "kanban_list" not in worker
+    assert "kanban_archive" not in worker
     with delegated_child_context():
         assert not _names(["kanban"])
     assert "kanban_complete" in _names(["file"])

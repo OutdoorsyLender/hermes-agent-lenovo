@@ -284,39 +284,30 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
-    import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kbc.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "SELECT id, workspace_kind, workspace_path FROM tasks "
+            "WHERE status = 'archived' AND preserve_from_gc = 0"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook.
-            # Same safety predicate: only clean, fully-pushed worktrees go.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        for row in rows:
+            path = (
+                Path(row["workspace_path"])
+                if row["workspace_path"]
+                else scratch_root / row["id"]
+                if row["workspace_kind"] == "scratch"
+                else None
+            )
+            if path is not None and not row["workspace_path"]:
+                # Preserve legacy GC's canonical ``workspaces/<id>`` fallback,
+                # while persisting it so the cleanup/archive handshake binds
+                # the exact path it is about to authorize.
+                kbw.set_workspace_path(conn, row["id"], path)
+            existed = bool(path and path.is_dir())
+            kbw._cleanup_workspace(conn, row["id"])
+            if existed and path is not None and not path.is_dir():
+                removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)

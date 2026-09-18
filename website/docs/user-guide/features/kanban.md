@@ -30,7 +30,7 @@ checkpoint; their iteration warning remains opt-in.
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_archive`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher gives workers the task-scoped lifecycle subset; orchestrator profiles can explicitly enable the broader toolset, including cross-task list/archive/unblock operations. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -321,6 +321,32 @@ hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
+For superseded dependency trees, use the preservation-safe two-step mode instead
+of legacy per-card archival. Preflight validates that the explicit set has no
+non-terminal child outside it and returns a token bound to task statuses, active
+run ids, and incident dependency links. Commit accepts that token only while the
+reviewed graph is unchanged, archives descendants before roots in one transaction,
+and marks workspaces and historical events for durable preservation from routine
+`hermes kanban gc` retention. Explicit `archive --rm` remains a destructive,
+separate operator action:
+
+```bash
+hermes kanban archive --safe preflight \
+  --protect t_current --json t_child t_root
+
+hermes kanban archive --safe commit \
+  --protect t_current --superseded-by t_current \
+  --reason SUPERSEDED_NO_EXECUTION \
+  --expected-token <token-from-preflight> --json \
+  t_child t_root
+```
+
+Repeat `--protect` and `--superseded-by` as needed; every superseding task must
+also be protected in the reviewed preflight. Safe archival refuses running
+or protected tasks, stale preflight tokens, and incomplete dependency boundaries.
+It preserves task bodies, comments, prior events, runs, links, attachments,
+notification subscriptions, attachment files, and task workspaces.
+
 :::note Where an unblocked task lands
 `unblock` restores the safe source phase: **`review`** for reviewer-origin work
 whose parents are complete, **`ready`** for implementation work whose parents
@@ -372,6 +398,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 |---|---|---|
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
+| `kanban_archive` | (Orchestrators) preflight, review, then atomically archive an explicit descendants-first set without promoting children or deleting evidence/workspaces. | `action`, `task_ids`, `protected_task_ids` |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |

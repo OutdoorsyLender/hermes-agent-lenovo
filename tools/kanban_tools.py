@@ -20,6 +20,7 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ARCHIVE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
@@ -831,6 +832,44 @@ def _handle_attachments(args: dict, **kw) -> str:
                 _fields(a, _ATTACHMENT_FIELDS) for a in kb.list_attachments(conn, tid)]})
 
 
+@_kanban_handler("kanban_archive")
+def _handle_archive(args: dict, **kw) -> str:
+    """Two-step, token-bound archival of a reviewed cross-task set."""
+    _reject_delegated_child_mutation("kanban_archive")
+    _require_orchestrator_tool("kanban_archive")
+    action = str(args.get("action") or "").strip().lower()
+    _check(action in {"preflight", "commit"}, "action must be 'preflight' or 'commit'")
+    task_ids = _coerce_str_list(args.get("task_ids"), "task_ids", "task ids")
+    protected = _coerce_str_list(
+        args.get("protected_task_ids"), "protected_task_ids", "protected task ids")
+    _check(task_ids, "task_ids must contain at least one explicit reviewed task id")
+    with _board(args.get("board")) as (kb, conn):
+        if action == "preflight":
+            plan = kb.plan_preservation_safe_archive(
+                conn, task_ids, protected_task_ids=protected)
+            return _ok(**plan, workspace_preserved=True)
+
+        reason = str(args.get("reason") or "").strip()
+        token = str(args.get("expected_dependency_token") or "").strip()
+        _check(reason, "reason is required for commit")
+        _check(token, "expected_dependency_token from preflight is required for commit")
+        superseded_by = _coerce_str_list(
+            args.get("superseded_by") or [], "superseded_by", "superseding task ids")
+        archived = kb.archive_tasks_preservation_safe(
+            conn,
+            task_ids,
+            reason=reason,
+            superseded_by=superseded_by,
+            protected_task_ids=protected,
+            expected_dependency_token=token,
+        )
+        return _ok(
+            archived_task_ids=archived,
+            count=len(archived),
+            workspace_preserved=True,
+        )
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -989,11 +1028,12 @@ def _handle_link(args: dict, **kw) -> str:
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
-# kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# Cross-task routing/mutation tools are hidden from dispatcher task workers.
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_archive", "kanban_unblock"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),

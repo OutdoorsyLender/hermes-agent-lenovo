@@ -157,11 +157,18 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_markers = migrated.execute(
+            "SELECT preserve_from_gc, workspace_cleaned "
+            "FROM tasks WHERE id='legacy'"
+        ).fetchone()
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "preserve_from_gc" in task_columns
+    assert "workspace_cleaned" in task_columns
+    assert tuple(legacy_markers) == (0, 0)
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
