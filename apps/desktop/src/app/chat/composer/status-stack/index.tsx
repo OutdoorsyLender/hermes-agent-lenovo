@@ -31,6 +31,7 @@ import {
 import { $freeTierRoute, $freeTierStatus, freeTierStripPending } from '@/store/free-tier'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
 import { $sessionControlBySession, refreshSessionControl } from '@/store/session-control'
+import { $sessionOwnerResolutionRevisionBySession } from '@/store/session-states'
 import { $threadScrolledUpBySession } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
@@ -135,8 +136,11 @@ export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStat
     return raw
   }, [items, isStructuredSupported])
 
-  // Seed from the registry on session open; event-driven refreshes (terminal /
-  // process tool completions) live in use-message-stream. This must NOT reset
+  // Seed from the registry on session open. A fresh runtime can mount before
+  // its first gateway event proves which connection owns it; retry once that
+  // route arrives instead of latching the initial owner-resolution failure.
+  // Event-driven refreshes (terminal / process tool completions) otherwise live
+  // in use-message-stream. This must NOT reset
   // the gone-polling latch: a mount/remount is not proof of a fresh runtime
   // binding (a boot-restored tile can remount repeatedly while still bound to
   // a dead runtime id), so clearing it here re-arms an endless 4001 storm
@@ -144,10 +148,26 @@ export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStat
   // gateway reconnect and runtime re-mint (see resetBackgroundPollingGuard
   // call sites in use-gateway-boot.ts and store/gateway.ts).
   useEffect(() => {
-    if (sessionId) {
+    if (!sessionId) {
+      return
+    }
+
+    const refresh = () => {
       void refreshBackgroundProcesses(sessionId)
       void refreshSessionControl(sessionId)
     }
+
+    const unlisten = $sessionOwnerResolutionRevisionBySession.listen((revisions, previous) => {
+      const revision = revisions[sessionId]
+
+      if (revision !== undefined && revision !== previous[sessionId]) {
+        refresh()
+      }
+    })
+
+    refresh()
+
+    return unlisten
   }, [sessionId])
 
   const hasRunningBackground = groups.some(g => g.type === 'background' && g.items.some(i => i.state === 'running'))

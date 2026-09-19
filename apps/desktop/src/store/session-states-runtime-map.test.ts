@@ -7,6 +7,7 @@ import { $profiles } from '@/store/profile'
 import { _resetSessionOwnerHintsForTests, setSessionOwnerHint, setSessions } from '@/store/session'
 import { isSessionOwnerResolutionError } from '@/store/session-owner-resolution'
 import {
+  $sessionOwnerResolutionRevisionBySession,
   $sessionTiles,
   clearAllSessionStates,
   dropSessionState,
@@ -145,6 +146,18 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
     expect(knownOwnerForSession('rt-unprofiled')).toEqual({ connectionId: 'homelab', profile: 'default' })
   })
 
+  it('publishes once when an inbound event makes a runtime owner resolvable', () => {
+    const before = $sessionOwnerResolutionRevisionBySession.get()['rt-late-owner'] ?? 0
+
+    recordSessionEventScope({ connectionId: 'homelab', profile: 'omar', session_id: 'rt-late-owner' })
+
+    expect($sessionOwnerResolutionRevisionBySession.get()['rt-late-owner']).toBe(before + 1)
+    // Repeated traffic from the same producer must not create a render/refetch
+    // loop for consumers waiting on ownership discovery.
+    recordSessionEventScope({ connectionId: 'homelab', profile: 'omar', session_id: 'rt-late-owner' })
+    expect($sessionOwnerResolutionRevisionBySession.get()['rt-late-owner']).toBe(before + 1)
+  })
+
   it('still prefers the durable stored owner when a stale runtime ledger entry collides with a stored id (#97511)', () => {
     // Pathological collision: some dead runtime's id equals a live stored id.
     // The persisted hint (durable identity) must outrank the ledger entry.
@@ -166,9 +179,11 @@ describe('knownOwnerForSession / requestForOwnedSession', () => {
   it('drops the recorded event owner together with the runtime state (#97511)', () => {
     recordSessionEventScope({ connectionId: 'homelab', profile: 'omar', session_id: 'rt-dropped' })
     expect(knownOwnerForSession('rt-dropped')).toEqual({ connectionId: 'homelab', profile: 'omar' })
+    expect($sessionOwnerResolutionRevisionBySession.get()['rt-dropped']).toBe(1)
 
     dropSessionState('rt-dropped')
     expect(knownOwnerForSession('rt-dropped')).toBeUndefined()
+    expect($sessionOwnerResolutionRevisionBySession.get()['rt-dropped']).toBeUndefined()
   })
 
   it('answers an approval on a sole-local registry install through the primary socket (#96394)', async () => {
