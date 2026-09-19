@@ -319,6 +319,34 @@ class TestCLI:
         assert slugs == ["default"]
         assert data[0]["is_current"] is True
 
+    def test_boards_list_counts_each_db_when_worker_db_is_pinned(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "alpha"], env_extra=env).returncode == 0
+        assert _cli(["boards", "create", "beta"], env_extra=env).returncode == 0
+        assert _cli(["--board", "alpha", "create", "Alpha task", "--assignee", "dev"],
+                    env_extra=env).returncode == 0
+        for title in ("Beta task one", "Beta task two"):
+            assert _cli(["--board", "beta", "create", title, "--assignee", "dev"],
+                        env_extra=env).returncode == 0
+
+        pinned_env = {
+            **env,
+            "HERMES_KANBAN_DB": str(tmp_path / "kanban" / "boards" / "alpha" / "kanban.db"),
+        }
+        res = _cli(["boards", "list", "--json"], env_extra=pinned_env)
+        assert res.returncode == 0, res.stderr
+        boards = {board["slug"]: board for board in json.loads(res.stdout)}
+        assert boards["alpha"]["counts"] == {"ready": 1}
+        assert boards["beta"]["counts"] == {"ready": 2}
+        assert Path(boards["alpha"]["db_path"]).name == "kanban.db"
+        assert Path(boards["alpha"]["db_path"]).parent.name == "alpha"
+        assert Path(boards["beta"]["db_path"]).parent.name == "beta"
+
+        # Other commands keep worker-pinned semantics: path and counts must agree.
+        show = _cli(["boards", "show"], env_extra=pinned_env)
+        assert show.returncode == 0, show.stderr
+        assert "Tasks:        1 total" in show.stdout
+        assert str(tmp_path / "kanban" / "boards" / "alpha" / "kanban.db") in show.stdout
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

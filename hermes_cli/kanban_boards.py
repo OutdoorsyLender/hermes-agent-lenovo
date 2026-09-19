@@ -6,6 +6,7 @@ Filesystem-only, so every action works before ``kanban init`` and must ignore th
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -22,12 +23,22 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     return handler(args)
 
 
-def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+def _board_db_path(slug: str) -> Path:
+    """Physical DB for a listed board, ignoring a worker's pinned DB."""
+    return (
+        kb.kanban_home() / "kanban.db"
+        if slug == kb.DEFAULT_BOARD
+        else kb.board_dir(slug) / "kanban.db"
+    )
+
+
+def _board_task_counts(slug: str, *, db_path: Optional[Path] = None) -> dict[str, int]:
+    """``{status: count}`` for a board. ``db_path`` bypasses worker pinning."""
     try:
-        if not kb.kanban_db_path(board=slug).exists():
+        path = db_path or kb.kanban_db_path(board=slug)
+        if not path.exists():
             return {}
-        with kbc.connect_closing(board=slug) as conn:
+        with kbc.connect_closing(db_path=path) as conn:
             rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:
@@ -52,8 +63,10 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     boards = kb.list_boards(include_archived=bool(getattr(args, "all", False)))
     current = kb.get_current_board()
     for b in boards:
+        path = _board_db_path(b["slug"])
+        b["db_path"] = str(path)
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
+        b["counts"] = _board_task_counts(b["slug"], db_path=path)
         b["total"] = sum(b["counts"].values())
     if _json_out(args, boards):
         return 0
