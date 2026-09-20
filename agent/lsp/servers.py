@@ -59,7 +59,6 @@ class SpawnSpec:
     cwd: str
     env: Dict[str, str] = field(default_factory=dict)
     initialization_options: Dict[str, Any] = field(default_factory=dict)
-    seed_diagnostics_on_first_push: bool = False
 
 
 @dataclass
@@ -70,7 +69,6 @@ class ServerDef:
     extensions: Tuple[str, ...]
     resolve_root: _RootFn
     build_spawn: _SpawnFn
-    seed_first_push: bool = False
     description: str = ""
     # Server handles ``workspace/didChangeWorkspaceFolders``: one process serves every project root
     # (git worktrees included) as extra workspaceFolders instead of one process per root.
@@ -132,19 +130,18 @@ def _find_binary(ctx: ServerContext, server_id: str, which: Sequence[str], insta
 
 
 def _make_spec(root: str, ctx: ServerContext, server_id: str, command: List[str],
-               base_init: Optional[Dict[str, Any]] = None, seed: bool = False) -> SpawnSpec:
+               base_init: Optional[Dict[str, Any]] = None) -> SpawnSpec:
     init = ctx.init_overrides.get(server_id, {}) if base_init is None else {**base_init, **ctx.init_overrides.get(server_id, {})}
     return SpawnSpec(command, root, root, env=ctx.env_overrides.get(server_id, {}),
-                     initialization_options=init, seed_diagnostics_on_first_push=seed)
+                     initialization_options=init)
 
 
 def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = (),
-                  install_pkg: Optional[str] = None, base_init: Optional[Dict[str, Any]] = None,
-                  seed: bool = False) -> _SpawnFn:
+                  install_pkg: Optional[str] = None, base_init: Optional[Dict[str, Any]] = None) -> _SpawnFn:
     """Build a spawn function for the common single-binary server shape."""
     def build(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
         bin_path = _find_binary(ctx, server_id, which, install_pkg)
-        return None if bin_path is None else _make_spec(root, ctx, server_id, [bin_path, *args], base_init, seed)
+        return None if bin_path is None else _make_spec(root, ctx, server_id, [bin_path, *args], base_init)
     return build
 
 
@@ -266,14 +263,14 @@ def _server(server_id: str, extensions: Tuple[str, ...], description: str, *,
             markers: Optional[Sequence[str]] = None, excludes: Sequence[str] = (),
             resolve_root: Optional[_RootFn] = None, build_spawn: Optional[_SpawnFn] = None,
             which: Sequence[str] = (), args: Sequence[str] = (), install_pkg: Optional[str] = None,
-            base_init: Optional[Dict[str, Any]] = None, seed: bool = False,
+            base_init: Optional[Dict[str, Any]] = None,
             multi_root: bool = False) -> ServerDef:
     """Registry entry factory: defaults to marker-based root + single-binary spawn."""
     return ServerDef(
         server_id, extensions,
         resolve_root or _markers_root(markers, excludes),
-        build_spawn or _simple_spawn(server_id, which or (server_id,), args, install_pkg, base_init, seed),
-        seed_first_push=seed, description=description, multi_root=multi_root,
+        build_spawn or _simple_spawn(server_id, which or (server_id,), args, install_pkg, base_init),
+        description=description, multi_root=multi_root,
     )
 
 
@@ -283,7 +280,7 @@ SERVERS: List[ServerDef] = [
             build_spawn=_spawn_pyright, multi_root=True),
     _server("typescript", (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"),
             "JavaScript/TypeScript — typescript-language-server", resolve_root=_root_typescript,
-            which=("typescript-language-server",), args=("--stdio",), install_pkg="typescript-language-server", seed=True),
+            which=("typescript-language-server",), args=("--stdio",), install_pkg="typescript-language-server"),
     _server("vue-language-server", (".vue",), "Vue.js — @vue/language-server", resolve_root=_root_typescript,
             args=("--stdio",), install_pkg="@vue/language-server"),
     _server("svelte-language-server", (".svelte",), "Svelte — svelte-language-server", resolve_root=_root_typescript,

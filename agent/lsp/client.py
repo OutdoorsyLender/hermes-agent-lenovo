@@ -75,14 +75,43 @@ def _folder(root: str) -> Dict[str, str]:
     return {"name": os.path.basename(root.rstrip(os.sep)) or root, "uri": file_uri(root)}
 
 
+def _strip_windows_drive(raw: str) -> str:
+    """``/c:/Users/x`` → ``C:/Users/x``: the slash before a drive letter is not a path component.
+
+    The letter is upper-cased because servers normalising through ``vscode-uri`` lower-case it.
+    """
+    if len(raw) > 2 and raw[0] == "/" and raw[2] == ":" and raw[1].isascii() and raw[1].isalpha():
+        return raw[1].upper() + raw[2:]
+    return raw
+
+
 def uri_to_path(uri: str) -> str:
-    """Inverse of :func:`file_uri`."""
+    """Inverse of :func:`file_uri`.
+
+    ``unquote`` runs BEFORE the drive-letter check: Node-based servers (typescript-language-server,
+    vtsls, the vue/svelte/astro/yaml/bash language servers, ...) re-normalise URIs through
+    ``vscode-uri``, which percent-encodes the drive colon (``file:///c%3A/Users/x``) and lower-cases
+    the letter.  Testing for ``:`` on the still-encoded string misses both, and the phantom path it
+    returns (``\\c:\\Users\\x``) never matches the key the caller opened the document under — the
+    server's diagnostics are received and then silently dropped.
+    """
     if not uri.startswith("file://"):
         return uri
-    raw = uri[len("file://"):]
-    if os.name == "nt" and raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
-        raw = raw[1:]  # strip leading slash before drive letter
-    return os.path.normpath(unquote(raw))
+    raw = unquote(uri[len("file://"):])
+    if os.name == "nt":
+        raw = _strip_windows_drive(raw)
+    return os.path.normpath(raw)
+
+
+def _doc_key(path: str) -> str:
+    """``self._docs`` key for ``path``: absolute and case-folded.
+
+    Documents are opened by path but addressed by servers in URIs, and the two spellings differ in
+    ways Windows does not treat as significant (drive-letter case, separator).  Every store and every
+    lookup goes through here — one call site spelling a path differently would create a second,
+    invisible entry beside the real one and discard whatever the server pushed into it.
+    """
+    return os.path.normcase(os.path.abspath(path))
 
 
 def _end_position(text: str) -> Dict[str, int]:
@@ -108,7 +137,6 @@ class _DocState:
     pull: List[Dict[str, Any]] = field(default_factory=list)
     push_version: int = -1
     pull_version: int = -1
-    seed_seen: bool = False
 
     def fresh_push(self, version: Optional[int] = None) -> bool:
         return self.push_version >= (self.version if version is None else version)
@@ -126,8 +154,7 @@ class LSPClient:
 
     def __init__(self, *, server_id: str, workspace_root: str, command: List[str],
                  env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None,
-                 initialization_options: Optional[Dict[str, Any]] = None,
-                 seed_diagnostics_on_first_push: bool = False) -> None:
+                 initialization_options: Optional[Dict[str, Any]] = None) -> None:
         self.server_id = server_id
         self.workspace_root = workspace_root
         # Roots this server serves.  Single-root servers only ever hold ``workspace_root``;
@@ -137,7 +164,6 @@ class LSPClient:
         self._env = env
         self._cwd = cwd or workspace_root
         self._init_options = initialization_options or {}
-        self._seed_first_push = seed_diagnostics_on_first_push
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
@@ -161,7 +187,7 @@ class LSPClient:
             "textDocument/publishDiagnostics": self._handle_publish_diagnostics,
         }
 
-        self._docs: Dict[str, _DocState] = {}  # keyed by absolute path (NOT URI)
+        self._docs: Dict[str, _DocState] = {}  # keyed by _doc_key(path) (NOT URI)
         self._state: str = "stopped"
         self._sync_kind: int = 1  # 1=Full, 2=Incremental
         self._stopping: bool = False
@@ -453,17 +479,14 @@ class LSPClient:
             return
         diagnostics = params.get("diagnostics") or []
         version = params.get("version")
-        doc = self._docs.setdefault(uri_to_path(params["uri"]), _DocState(version=-1))
-        is_seed = self._seed_first_push and not doc.seed_seen
-        doc.seed_seen = True
+        doc = self._docs.setdefault(_doc_key(uri_to_path(params["uri"])), _DocState(version=-1))
         doc.push = diagnostics if isinstance(diagnostics, list) else []
-        if is_seed:
-            # First push is baseline data only: it predates any didChange we sent,
-            # so it's stored WITHOUT a freshness tag and never satisfies a waiter.
-            return
         # Tag with the echoed version when provided; otherwise credit the current
         # version (a push observed after our change describes it or newer).  doc.version
         # is -1 for never-opened paths (relatedDocuments spillover), keeping them unfresh.
+        # A server that publishes only in response to our didOpen (typescript-language-server
+        # does, for a file it has not seen before) therefore still yields a verdict on the
+        # content we just sent — there is no later push to wait for.
         doc.push_version = version if isinstance(version, int) else doc.version
         # Keep the Event sticky-set so in-progress waits resolve; waiters
         # compare ``_push_counter`` to detect a genuinely new push.
@@ -482,7 +505,8 @@ class LSPClient:
         except OSError as e:
             raise LSPProtocolError(f"cannot read {abs_path}: {e}") from e
         uri = file_uri(abs_path)
-        doc = self._docs.get(abs_path)
+        key = _doc_key(abs_path)
+        doc = self._docs.get(key)
         if doc is not None and doc.version < 0:
             doc = None  # never opened (relatedDocuments spillover): treat as new
         # FileChangeType: 1 = CREATED, 2 = CHANGED.
@@ -491,7 +515,7 @@ class LSPClient:
         )
         if doc is None:
             # Fresh state: anything a pre-open push stashed under this path (relatedDocuments spillover) is discarded.
-            self._docs[abs_path] = _DocState(version=0, text=text)
+            self._docs[key] = _DocState(version=0, text=text)
             await self._send_notification(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": uri, "languageId": language_id, "version": 0, "text": text}},
@@ -527,7 +551,7 @@ class LSPClient:
         version captured at send time, so a didChange racing past the request makes them stale
         automatically.  Silently no-ops on errors (server may not support pull)."""
         abs_path = os.path.abspath(path)
-        doc = self._docs.get(abs_path)
+        doc = self._docs.get(_doc_key(abs_path))
         sent_version = doc.version if doc else -1
         try:
             result = await self._send_request_with_retry(
@@ -547,7 +571,7 @@ class LSPClient:
         for doc_path, report, tag in reports:
             items = report.get("items") if isinstance(report, dict) else None
             if isinstance(items, list):
-                d = self._docs.setdefault(doc_path, _DocState(version=-1))
+                d = self._docs.setdefault(_doc_key(doc_path), _DocState(version=-1))
                 d.pull = items
                 d.pull_version = d.version if tag is None else tag
 
@@ -579,7 +603,7 @@ class LSPClient:
             for t in pending:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
-            doc = self._docs.get(abs_path)
+            doc = self._docs.get(_doc_key(abs_path))
             if doc and doc.fresh(version):
                 return True
 
@@ -598,7 +622,7 @@ class LSPClient:
         deadline = now() + timeout
         baseline = self._push_counter
         while True:
-            doc = self._docs.get(path)
+            doc = self._docs.get(_doc_key(path))
             if doc and doc.fresh_push(version):
                 # Debounce: TS often emits in pairs.  Snapshot the counter so
                 # we wake on a *new* push, not the one that just satisfied us.
@@ -622,7 +646,7 @@ class LSPClient:
         """Merged + deduped push/pull diagnostics for one file.  With ``fresh_only=True`` a store only
         contributes once its version tag has caught up to the document's — report paths must use this
         so "stale" and "clean" aren't conflated."""
-        doc = self._docs.get(os.path.abspath(path))
+        doc = self._docs.get(_doc_key(path))
         if doc is None:
             return []
         push = doc.push if not fresh_only or doc.fresh_push() else []

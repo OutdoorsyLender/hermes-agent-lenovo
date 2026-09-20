@@ -107,7 +107,6 @@ def _install_mock_server(script: str, server_id: str = "pyright"):
         extensions=original.extensions,
         resolve_root=lambda fp, ws: ws,
         build_spawn=_spawn,
-        seed_first_push=False,
         description="mock " + server_id,
     )
     return target_index, original
