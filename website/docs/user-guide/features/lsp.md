@@ -211,7 +211,9 @@ otherwise. The staging tree is a **shared binary cache**, not
 profile data: every profile on the machine reads the same servers,
 so a language server is downloaded once instead of once per profile.
 A profile that already carries its own `lsp/` keeps using it as an
-override.
+override, and that override stays inside the profile — its shim is
+staged under that profile's own `lsp/bin/`, so the shared tree never
+ends up delegating into one profile's private `node_modules`.
 
 Nothing is ever installed to `/usr/local/`, `~/.local/`, or any other
 shared location — the staging dir is fully Hermes-owned.

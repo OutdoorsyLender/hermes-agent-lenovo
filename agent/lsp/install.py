@@ -5,12 +5,14 @@ user's global toolchain stays untouched.  That root is the *machine-level* home
 (``get_default_hermes_root()``), not the active profile: the staging tree is a
 re-downloadable binary cache, and a per-profile copy both duplicates the whole
 ``node_modules`` tree and leaves a profile with no server at all whenever only
-one home was ever provisioned.  Strategies: ``auto`` (install with
-the best available package manager), ``manual`` / ``off`` (probe only; a
-missing binary skips the server and ``hermes lsp status`` reports it).
-Installs run synchronously the first time a server is needed, serialized
-per-package; every failure path returns ``None`` so the tool layer falls
-back to its in-process syntax checker.
+one home was ever provisioned.  A profile-local ``lsp/`` (what pre-shared-root
+Hermes wrote) still wins as a read override, and staging it writes beside itself
+so the shared dir never delegates into one profile's private tree.  Strategies:
+``auto`` (install with the best available package manager), ``manual`` / ``off``
+(probe only; a missing binary skips the server and ``hermes lsp status`` reports
+it).  Installs run synchronously the first time a server is needed, serialized
+per-package; every failure path returns ``None`` so the tool layer falls back to
+its in-process syntax checker.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_constants import find_node_executable
+from hermes_constants import find_node_executable, hermes_home_key
 
 logger = logging.getLogger("agent.lsp.install")
 
@@ -67,7 +69,9 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
 }
 
 _install_locks: Dict[str, threading.Lock] = {}
-_install_results: Dict[str, Optional[str]] = {}
+# Keyed by (package, active home): a result resolved from a profile-local tree belongs to that
+# profile alone, and one process serves many profiles (multiplex gateway / Desktop serve / cron).
+_install_results: Dict[tuple, Optional[str]] = {}
 _install_lock_meta = threading.Lock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
@@ -90,7 +94,7 @@ def hermes_lsp_staging_root() -> Path:
 
 
 def hermes_lsp_bin_dir() -> Path:
-    """Return the Hermes-owned bin staging dir for LSP servers (the shared root; writes go here)."""
+    """The Hermes-owned shared ``bin/`` staging dir for LSP servers (the default write target)."""
     p = hermes_lsp_staging_root() / "bin"
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -102,12 +106,38 @@ def _lsp_staging_roots() -> list[Path]:
     A profile-local ``lsp/`` is what pre-shared-root Hermes wrote, so a profile that already
     provisioned its own server keeps resolving it (it wins as an override); every other profile —
     including one created fresh with an empty ``lsp/`` — falls through to the shared root instead
-    of re-downloading the tree.  Nothing is ever written to the profile-local dir any more.
+    of re-downloading the tree.  Installs always go to the shared root; the only thing written
+    under a profile-local dir is a shim for a server that already lives in that profile's own
+    tree (see ``_bin_dir_for``).
     """
     from hermes_constants import get_hermes_home
 
     roots = [get_hermes_home() / "lsp", hermes_lsp_staging_root()]
     return list({os.path.normcase(str(r)): r for r in roots}.values())
+
+
+def _bin_dir_for(target: Path) -> Path:
+    """The ``bin/`` dir that owns ``target``: the staging root it lives under.
+
+    A server resolved from a profile-local tree is staged into THAT profile's ``bin/``.  Writing
+    the shared ``bin/`` shim from it left a shim delegating into one profile's private
+    ``node_modules`` — which every other profile then resolved, and which breaks the moment that
+    profile is updated or deleted.  Targets outside every staging root (PATH, toolchains) stage
+    into the shared dir as before.
+    """
+    try:
+        resolved = target.resolve()
+    except OSError:
+        resolved = target
+    for root in _lsp_staging_roots():
+        try:
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        bin_dir = root / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        return bin_dir
+    return hermes_lsp_bin_dir()
 
 
 def _native_binary_candidates(base: Path) -> list[Path]:
@@ -164,22 +194,34 @@ def _existing_binary(name: str) -> Optional[str]:
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 
 
+def _install_cache_key(pkg: str) -> tuple:
+    """Cache key for an install result: the package AND the active home.
+
+    One process serves many profiles (multiplex gateway, Desktop ``serve``, cron ticker), and a
+    result resolved from a profile-local staging tree is that profile's binary.  Keying by package
+    alone handed profile two the private path profile one had resolved.
+    """
+    return (pkg, hermes_home_key())
+
+
 def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     """Try to install ``pkg``; return the binary path or ``None``.
 
     Only ``"auto"`` installs; ``"manual"``/``"off"`` just probe for an existing
-    binary.  Results are cached per package and concurrent calls are serialized.
+    binary.  Results are cached per package and active home, and concurrent calls
+    are serialized.
     """
     if strategy != "auto":
         return _existing_binary(INSTALL_RECIPES.get(pkg, {}).get("bin", pkg))
-    if pkg in _install_results:
-        return _install_results[pkg]
+    key = _install_cache_key(pkg)
+    if key in _install_results:
+        return _install_results[key]
     with _install_lock_meta:
         lock = _install_locks.setdefault(pkg, threading.Lock())
     with lock:
-        if pkg not in _install_results:
-            _install_results[pkg] = _do_install(pkg)
-        return _install_results[pkg]
+        if key not in _install_results:
+            _install_results[key] = _do_install(pkg)
+        return _install_results[key]
 
 
 def _do_install(pkg: str) -> Optional[str]:
@@ -237,7 +279,7 @@ def _stage_windows_shim(target: Path) -> str:
     the target's own resolution intact and works for ``.cmd``/``.bat``/``.exe`` alike.
     """
     name = target.name if target.suffix.lower() in _WINDOWS_WRAPPER_SUFFIXES else target.name + ".cmd"
-    link = hermes_lsp_bin_dir() / name
+    link = _bin_dir_for(target) / name
     body = f'{_SHIM_MARKER}\r\n@echo off\r\nCALL "{target}" %*\r\n'.encode("ascii", errors="replace")
     try:
         # Rewritten whenever it does not already delegate to this target, so a shim left
@@ -251,10 +293,10 @@ def _stage_windows_shim(target: Path) -> str:
 
 
 def _link_into_bin(target: Path) -> str:
-    """Stage ``target`` into ``lsp/bin/`` and return the path to use."""
+    """Stage ``target`` into the ``bin/`` dir of the staging root it lives under; return the path to use."""
     if _is_windows():
         return _stage_windows_shim(target)
-    link = hermes_lsp_bin_dir() / target.name
+    link = _bin_dir_for(target) / target.name
     if not link.exists():
         try:
             link.symlink_to(target)

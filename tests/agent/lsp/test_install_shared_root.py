@@ -11,7 +11,10 @@ The invariants pinned here:
 1. A profile with an empty ``lsp/`` still reports a server staged in the shared root as installed.
 2. ``install_strategy: auto`` reuses the shared package tree instead of shelling out to npm —
    that is what makes a fresh profile work without a download (and without a usable npm).
-3. A profile that already provisioned its own tree keeps winning, so sharing is additive.
+3. A profile that already provisioned its own tree keeps winning, so sharing is additive — and
+   that override stays *inside* the profile: it is neither cached into a sibling profile nor
+   staged into the shared ``bin/``, both of which leaked one profile's private binary to every
+   other profile in a process that serves several (multiplex gateway, Desktop ``serve``, cron).
 """
 from __future__ import annotations
 
@@ -21,6 +24,14 @@ from pathlib import Path
 import pytest
 
 from agent.lsp import install as install_mod
+
+
+@pytest.fixture(autouse=True)
+def _fresh_install_cache():
+    """``try_install`` memoizes per (package, active home); a stale entry masks a leak."""
+    install_mod._install_results.clear()
+    yield
+    install_mod._install_results.clear()
 
 
 @pytest.fixture
@@ -72,3 +83,49 @@ def test_a_profile_own_staging_dir_keeps_winning(profile_home, tmp_path):
 
     resolved = install_mod._existing_binary("pyright-langserver")
     assert resolved is not None and Path(resolved) == own
+
+
+def _profile(tmp_path: Path, name: str) -> Path:
+    home = tmp_path / "profiles" / name
+    home.mkdir(parents=True)
+    return home
+
+
+def test_a_profile_local_override_is_not_cached_into_the_next_profile(tmp_path, monkeypatch):
+    """Two profiles in ONE process must not share an install result.
+
+    One process serves many profiles (multiplex gateway, Desktop ``serve``, cron ticker).  Caching
+    the result by package alone handed profile two the private binary profile one had resolved
+    from its own tree, instead of the shared root it should fall back to.
+    """
+    one, two = _profile(tmp_path, "one"), _profile(tmp_path, "two")
+    own = _stage(one / "lsp" / "bin", "typescript-language-server")
+    shared = _stage(tmp_path / "lsp" / "bin", "typescript-language-server")
+
+    monkeypatch.setenv("HERMES_HOME", str(one))
+    first = install_mod.try_install("typescript-language-server")
+    assert first is not None and Path(first) == own
+
+    monkeypatch.setenv("HERMES_HOME", str(two))
+    second = install_mod.try_install("typescript-language-server")
+    assert second is not None and Path(second) == shared
+
+
+def test_a_profile_local_tree_is_staged_into_that_profile_not_the_shared_root(tmp_path, monkeypatch):
+    """The shared ``bin/`` must never delegate into one profile's private tree.
+
+    Staging a profile-local package tree into the shared ``bin/`` left a shim pointing at
+    ``profiles/<one>/lsp/node_modules``, which every other profile then resolved — and which
+    breaks the moment that profile is updated or deleted.
+    """
+    one = _profile(tmp_path, "one")
+    own_tree = _stage(one / "lsp" / "node_modules" / ".bin", "typescript-language-server")
+    _stage(tmp_path / "lsp" / "node_modules" / ".bin", "typescript-language-server")
+
+    monkeypatch.setenv("HERMES_HOME", str(one))
+    resolved = install_mod.try_install("typescript-language-server")
+
+    assert resolved is not None
+    assert own_tree.exists()
+    assert Path(resolved).parent == one / "lsp" / "bin"
+    assert not (tmp_path / "lsp" / "bin").exists(), "the shared staging dir must stay free of a profile-specific shim"
