@@ -21,8 +21,8 @@ from agent.lsp.protocol import LSPProtocolError
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _client(workspace: Path, script: str = "clean") -> LSPClient:
-    env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+def _client(workspace: Path, script: str = "clean", **extra_env: str) -> LSPClient:
+    env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", ""), **extra_env}
     return LSPClient(
         server_id=f"mock-{script}",
         workspace_root=str(workspace),
@@ -124,3 +124,33 @@ async def test_reader_failure_retires_client_and_rejects_later_work(
             )
     finally:
         await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_push_only_server_is_asked_for_pull_diagnostics_once(tmp_path: Path):
+    """A server rejecting the pull channel is asked once per client, not once per loop turn.
+
+    The rejection is an instantaneous error reply, so re-asking it inside the wait loop spun that
+    loop at thousands of requests a second (measured against typescript-language-server: 87,570
+    replies in a 30s wait) while the push channel — the only one such a server has — was starved.
+    The push verdict must still be delivered.
+    """
+    f = tmp_path / "x.py"
+    f.write_text("print('hi')\n", encoding="utf-8")
+    request_log = tmp_path / "requests.log"
+
+    client = _client(tmp_path, "versionless", MOCK_LSP_REQUEST_LOG=str(request_log))
+    await client.start()
+    try:
+        version = await client.open_file(str(f), language_id="python")
+        assert await client.wait_for_diagnostics(str(f), version, mode="document", timeout=1.0)
+        assert [d.get("code") for d in client.diagnostics_for(str(f))] == ["MOCK001"]
+
+        # A later wait for edited content must not re-ask either.
+        changed = await client.open_file(str(f), language_id="python")
+        assert await client.wait_for_diagnostics(str(f), changed, mode="document", timeout=1.0)
+    finally:
+        await client.shutdown()
+
+    pulls = [m for m in request_log.read_text(encoding="utf-8").split() if m == "textDocument/diagnostic"]
+    assert pulls == ["textDocument/diagnostic"]

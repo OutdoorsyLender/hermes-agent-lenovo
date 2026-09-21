@@ -70,6 +70,19 @@ def write_message(obj):
     sys.stdout.buffer.flush()
 
 
+def _log_request(msg):
+    """Append one inbound request's method to ``MOCK_LSP_REQUEST_LOG`` when set.
+
+    Lets a test assert how many times the client asked something (e.g. that a server which
+    rejects the pull endpoint is not re-asked inside the wait loop).
+    """
+    path = os.environ.get("MOCK_LSP_REQUEST_LOG")
+    if not path or "id" not in msg:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{msg.get('method')}\n")
+
+
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
 
@@ -77,6 +90,8 @@ def main():
         msg = read_message()
         if msg is None:
             return 0
+
+        _log_request(msg)
 
         if "id" in msg and msg.get("method") == "initialize":
             if script == "slow":

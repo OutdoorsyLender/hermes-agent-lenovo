@@ -82,13 +82,33 @@ def hermes_lsp_bin_dir() -> Path:
 
 
 def _native_binary_candidates(base: Path) -> list[Path]:
-    """Return platform-native executable candidates for a staged binary (``base`` plus Windows wrappers)."""
+    """Return the executable candidates for a staged binary, best first.
+
+    On Windows the ``.cmd``/``.exe``/``.bat`` wrappers come BEFORE the bare name: npm
+    writes an extensionless POSIX sh shim beside every ``.cmd``, and ``CreateProcess``
+    cannot start that shim (``WinError 193``).  Preferring it — which the old ordering
+    did — hands the LSP client a command that always fails to spawn.
+    """
     if not _is_windows():
         return [base]
     cands: Dict[str, Path] = {}
-    for c in (base, *(Path(str(base) + s) for s in _WINDOWS_WRAPPER_SUFFIXES)):
+    for c in (*(Path(str(base) + s) for s in _WINDOWS_WRAPPER_SUFFIXES), base):
         cands.setdefault(str(c).lower(), c)
     return list(cands.values())
+
+
+def _runnable(staged: Path) -> bool:
+    """True iff ``staged`` is a file this host can actually start.
+
+    ``os.access(X_OK)`` is True for every existing file on Windows (there is no execute
+    bit), so it cannot tell a real wrapper from npm's POSIX sh shim; the suffix is the
+    only signal available there.
+    """
+    if not staged.exists():
+        return False
+    if _is_windows() and staged.suffix.lower() not in _WINDOWS_WRAPPER_SUFFIXES:
+        return False
+    return os.access(staged, os.X_OK)
 
 
 def _first_existing(*bases: Path) -> Optional[Path]:
@@ -96,12 +116,17 @@ def _first_existing(*bases: Path) -> Optional[Path]:
     return next((c for base in bases for c in _native_binary_candidates(base) if c.exists()), None)
 
 
+def _npm_bin_binary(bin_name: str) -> Optional[Path]:
+    """The npm-installed entry point for ``bin_name`` in the staging tree (``<home>/lsp``)."""
+    return _first_existing(hermes_lsp_bin_dir().parent / "node_modules" / ".bin" / bin_name)
+
+
 def _existing_binary(name: str) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
     for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
-        if staged.exists() and os.access(staged, os.X_OK):
+        if _runnable(staged):
             return str(staged)
-    suffixes = ("", *_WINDOWS_WRAPPER_SUFFIXES) if _is_windows() else ("",)
+    suffixes = (".cmd", ".exe", ".bat", "") if _is_windows() else ("",)
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 
 
@@ -129,6 +154,13 @@ def _do_install(pkg: str) -> Optional[str]:
         return shutil.which(pkg)  # not in our registry — best-effort: just probe PATH
     strategy = recipe.get("strategy", "manual")
     bin_name = recipe.get("bin", pkg)
+    if strategy == "npm" and (installed := _npm_bin_binary(bin_name)) is not None:
+        # The staged shim is derived state; the package tree is the real artifact.  Re-stage
+        # from it on every call so a shim written by an older staging (a copied POSIX sh
+        # script, a shim whose relative target no longer resolves) is repaired rather than
+        # handed back as a working binary — that loop is how install reports success while
+        # the server stays unusable.
+        return _link_into_bin(installed)
     if existing := _existing_binary(bin_name):
         return existing
     if strategy == "manual":
@@ -157,14 +189,43 @@ def _run_installer(tool: str, pkg: str, cmd: list, *, timeout: int, env: Optiona
     return True
 
 
+_SHIM_MARKER = "@rem hermes-lsp-shim"
+
+
+def _stage_windows_shim(target: Path) -> str:
+    """Stage a ``.cmd`` in ``lsp/bin/`` that runs ``target`` by ABSOLUTE path; return its path.
+
+    npm shims resolve their payload relative to their own directory (``%~dp0\\..``), so a
+    link from the staging dir is only correct if the link keeps the shim's own directory —
+    and it does not: this host has no symlink privilege (``WinError 1314``), and the copy
+    fallback then pointed that relative path at ``lsp/<pkg>/lib/...``, a tree that does not
+    exist, leaving a staged binary that fails at spawn.  Delegating by absolute path keeps
+    the target's own resolution intact and works for ``.cmd``/``.bat``/``.exe`` alike.
+    """
+    name = target.name if target.suffix.lower() in _WINDOWS_WRAPPER_SUFFIXES else target.name + ".cmd"
+    link = hermes_lsp_bin_dir() / name
+    body = f'{_SHIM_MARKER}\r\n@echo off\r\nCALL "{target}" %*\r\n'.encode("ascii", errors="replace")
+    try:
+        # Rewritten whenever it does not already delegate to this target, so a shim left
+        # behind by an older (broken) staging is repaired instead of silently reused.
+        if not link.is_file() or link.read_bytes() != body:
+            link.write_bytes(body)
+    except OSError as e:
+        logger.warning("[install] could not stage %s: %s", link, e)
+        return str(target)
+    return str(link)
+
+
 def _link_into_bin(target: Path) -> str:
-    """Symlink (or copy, where symlinks fail) ``target`` into ``lsp/bin/`` and return the path to use."""
+    """Stage ``target`` into ``lsp/bin/`` and return the path to use."""
+    if _is_windows():
+        return _stage_windows_shim(target)
     link = hermes_lsp_bin_dir() / target.name
     if not link.exists():
         try:
             link.symlink_to(target)
         except (OSError, NotImplementedError):
-            # Symlinks fail on some Windows setups — copy instead.
+            # Symlinks fail on some setups — copy instead.
             try:
                 shutil.copy2(target, link)
             except OSError:
@@ -186,7 +247,7 @@ def _install_npm(pkg: str, bin_name: str, extra_pkgs: Optional[list] = None) -> 
     cmd = [npm, "install", "--prefix", str(staging), "--silent", "--no-fund", "--no-audit", *install_targets]
     if not _run_installer("npm", pkg, cmd, timeout=300):
         return None
-    found = _first_existing(staging / "node_modules" / ".bin" / bin_name)
+    found = _npm_bin_binary(bin_name)
     if found is not None:
         return _link_into_bin(found)
     logger.warning("[install] npm install for %s succeeded but bin %s not found", pkg, bin_name)
