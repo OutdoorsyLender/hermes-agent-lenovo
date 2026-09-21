@@ -732,6 +732,17 @@ def find_hermes_node_executable(command: str) -> str | None:
     return resolved
 
 
+def _expand_path_entry(entry: str) -> str:
+    """Expand ``%VAR%``/``$VAR`` references left literal inside a PATH entry.
+
+    A PATH entry reaches a child process as the literal reference often enough to matter
+    (this box's worker processes carry ``%NVM_HOME%``/``%NVM_SYMLINK%`` verbatim), and
+    ``Path("%NVM_SYMLINK%") / "npm.cmd"`` matches nothing, so a tool that is one expansion
+    away reads as not installed.  Only entries that still carry a reference are touched.
+    """
+    return os.path.expandvars(entry) if "%" in entry or "$" in entry else entry
+
+
 def find_node_executable_on_path(command: str) -> str | None:
     """Node/npm from PATH; on Windows prefer ``.cmd``/``.exe`` (CreateProcess cannot run the bare shim)."""
     if sys.platform != "win32":
@@ -739,7 +750,7 @@ def find_node_executable_on_path(command: str) -> str | None:
     command_str = str(command)
     if any(sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")):
         return command_str if Path(command_str).is_file() else None
-    directories = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    directories = [_expand_path_entry(d) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
     for name in _candidate_node_command_names(command_str):
         for directory in directories:
             if (Path(directory) / name).is_file():

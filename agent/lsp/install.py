@@ -1,7 +1,11 @@
 """Auto-installation of LSP server binaries.
 
-Installs go to a Hermes-owned staging dir, ``<HERMES_HOME>/lsp/bin/``, so the
-user's global toolchain stays untouched.  Strategies: ``auto`` (install with
+Installs go to a Hermes-owned staging dir, ``<root home>/lsp/bin/``, so the
+user's global toolchain stays untouched.  That root is the *machine-level* home
+(``get_default_hermes_root()``), not the active profile: the staging tree is a
+re-downloadable binary cache, and a per-profile copy both duplicates the whole
+``node_modules`` tree and leaves a profile with no server at all whenever only
+one home was ever provisioned.  Strategies: ``auto`` (install with
 the best available package manager), ``manual`` / ``off`` (probe only; a
 missing binary skips the server and ``hermes lsp status`` reports it).
 Installs run synchronously the first time a server is needed, serialized
@@ -37,7 +41,7 @@ def _manual(bin_name: str) -> Dict[str, Any]:
 
 
 # Recipe key → {strategy, pkg, bin[, extra_pkgs]}.  After install we look for
-# ``bin`` in ``<HERMES_HOME>/lsp/bin/`` first, then on PATH.  ``extra_pkgs``
+# ``bin`` in ``<root home>/lsp/bin/`` first, then on PATH.  ``extra_pkgs``
 # are sibling npm packages a server needs in the same node_modules tree.
 INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "pyright": _npm("pyright", "pyright-langserver"),
@@ -72,13 +76,38 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def hermes_lsp_bin_dir() -> Path:
-    """Return the Hermes-owned bin staging dir for LSP servers."""
-    from hermes_constants import get_hermes_home
+def hermes_lsp_staging_root() -> Path:
+    """The machine-level LSP staging root, ``<root home>/lsp``, shared by every profile.
 
-    p = get_hermes_home() / "lsp" / "bin"
+    ``get_default_hermes_root()`` is the platform default home: ``<root>`` when
+    ``HERMES_HOME=<root>/profiles/<name>`` and the home itself otherwise, so a box with a single
+    home keeps exactly the path it had.  Profiles stay islands for config/sessions/secrets; this
+    tree is a re-downloadable binary cache next to the npm/uv stores, not profile data.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "lsp"
+
+
+def hermes_lsp_bin_dir() -> Path:
+    """Return the Hermes-owned bin staging dir for LSP servers (the shared root; writes go here)."""
+    p = hermes_lsp_staging_root() / "bin"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _lsp_staging_roots() -> list[Path]:
+    """Roots to READ, the active profile's own staging dir first, then the shared root.
+
+    A profile-local ``lsp/`` is what pre-shared-root Hermes wrote, so a profile that already
+    provisioned its own server keeps resolving it (it wins as an override); every other profile —
+    including one created fresh with an empty ``lsp/`` — falls through to the shared root instead
+    of re-downloading the tree.  Nothing is ever written to the profile-local dir any more.
+    """
+    from hermes_constants import get_hermes_home
+
+    roots = [get_hermes_home() / "lsp", hermes_lsp_staging_root()]
+    return list({os.path.normcase(str(r)): r for r in roots}.values())
 
 
 def _native_binary_candidates(base: Path) -> list[Path]:
@@ -117,15 +146,20 @@ def _first_existing(*bases: Path) -> Optional[Path]:
 
 
 def _npm_bin_binary(bin_name: str) -> Optional[Path]:
-    """The npm-installed entry point for ``bin_name`` in the staging tree (``<home>/lsp``)."""
-    return _first_existing(hermes_lsp_bin_dir().parent / "node_modules" / ".bin" / bin_name)
+    """The npm-installed entry point for ``bin_name`` in a staging tree (``<root>/lsp``)."""
+    for root in _lsp_staging_roots():
+        found = _first_existing(root / "node_modules" / ".bin" / bin_name)
+        if found is not None:
+            return found
+    return None
 
 
 def _existing_binary(name: str) -> Optional[str]:
-    """Probe the staging dir + PATH for a binary named ``name``."""
-    for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
-        if _runnable(staged):
-            return str(staged)
+    """Probe every staging dir + PATH for a binary named ``name``."""
+    for root in _lsp_staging_roots():
+        for staged in _native_binary_candidates(root / "bin" / name):
+            if _runnable(staged):
+                return str(staged)
     suffixes = (".cmd", ".exe", ".bat", "") if _is_windows() else ("",)
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 
@@ -241,7 +275,7 @@ def _install_npm(pkg: str, bin_name: str, extra_pkgs: Optional[list] = None) -> 
     if npm is None:
         logger.info("[install] cannot install %s: no usable npm found", pkg)
         return None
-    staging = hermes_lsp_bin_dir().parent  # <HERMES_HOME>/lsp/
+    staging = hermes_lsp_bin_dir().parent  # <root home>/lsp/ — machine-level, shared by profiles
     install_targets = [pkg] + list(extra_pkgs or [])
     logger.info("[install] npm install --prefix %s %s", staging, " ".join(install_targets))
     cmd = [npm, "install", "--prefix", str(staging), "--silent", "--no-fund", "--no-audit", *install_targets]
@@ -308,4 +342,4 @@ def detect_status(pkg: str) -> str:
     return "manual-only" if recipe and recipe.get("strategy") == "manual" else "missing"
 
 
-__all__ = ["INSTALL_RECIPES", "try_install", "detect_status", "hermes_lsp_bin_dir"]
+__all__ = ["INSTALL_RECIPES", "try_install", "detect_status", "hermes_lsp_bin_dir", "hermes_lsp_staging_root"]

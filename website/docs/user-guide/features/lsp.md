@@ -90,8 +90,8 @@ agent sees a syntax-clean file with semantic problems as
 
 For "manual" entries, install the server through whatever toolchain
 manager makes sense for that language (rustup, ghcup, opam, brew,
-…). Hermes auto-detects the binary on PATH or in
-`<HERMES_HOME>/lsp/bin/`.
+…). Hermes auto-detects the binary on PATH or in the shared
+staging dir (`<root home>/lsp/bin/` — see *Installation locations*).
 
 ### PowerShell
 
@@ -108,7 +108,7 @@ host. Setup:
    `PowerShellEditorServices/Start-EditorServices.ps1`. Either:
    - set `lsp.servers.powershell.command: ["/path/to/bundle"]` in
      `config.yaml`, or
-   - extract it to `<HERMES_HOME>/lsp/PowerShellEditorServices`, or
+   - extract it to `<root home>/lsp/PowerShellEditorServices`, or
    - export `PSES_BUNDLE_PATH=/path/to/bundle`.
 
 `hermes lsp status` reports `installed` once `pwsh` is found; if the
@@ -160,7 +160,7 @@ lsp:
   wait_timeout: 5.0
 
   # How to handle missing server binaries.
-  #   auto    — install via npm/pip/go install into <HERMES_HOME>/lsp/bin
+  #   auto    — install via npm/pip/go install into the shared <root home>/lsp/bin
   #   manual  — only use binaries already on PATH
   install_strategy: auto
 
@@ -199,14 +199,22 @@ lsp:
 ## Installation locations
 
 When `install_strategy: auto`, Hermes installs binaries into
-`<HERMES_HOME>/lsp/bin/`. NPM packages land in
-`<HERMES_HOME>/lsp/node_modules/` with bin symlinks one level up.
+`<root home>/lsp/bin/`. NPM packages land in
+`<root home>/lsp/node_modules/` with bin symlinks one level up.
 Go binaries come from `go install` with `GOBIN` pointed at the
 staging dir.
 
+`<root home>` is the machine-level Hermes home — the parent of
+`profiles/` when you use profiles (`~/.hermes`, or
+`%LOCALAPPDATA%\hermes` on Windows), and simply `$HERMES_HOME`
+otherwise. The staging tree is a **shared binary cache**, not
+profile data: every profile on the machine reads the same servers,
+so a language server is downloaded once instead of once per profile.
+A profile that already carries its own `lsp/` keeps using it as an
+override.
+
 Nothing is ever installed to `/usr/local/`, `~/.local/`, or any other
-shared location — the staging dir is fully Hermes-owned and is
-removed when you reset the profile.
+shared location — the staging dir is fully Hermes-owned.
 
 ## Performance characteristics
 
@@ -263,7 +271,8 @@ lsp:
 
 **`hermes lsp status` shows a server as "missing"**
 
-The binary isn't on PATH and isn't in `<HERMES_HOME>/lsp/bin/`. Run
+The binary isn't on PATH and isn't in the staging dir
+(`<root home>/lsp/bin/`). Run
 `hermes lsp install <server_id>` to attempt an auto-install, or
 install the binary manually through the language's normal toolchain.
 

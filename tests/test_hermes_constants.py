@@ -210,6 +210,27 @@ class TestHermesManagedNode:
 
         assert find_hermes_node_executable("npm") == str(npm_cmd)
 
+    @pytest.mark.windows_only
+    def test_windows_expands_env_refs_left_in_path_entries(self, tmp_path, monkeypatch):
+        """A PATH entry that arrives as ``%NVM_SYMLINK%`` still resolves the node tooling in it.
+
+        Worker processes spawned before a registry PATH edit carry entries verbatim; without the
+        expansion ``Path("%NVM_SYMLINK%") / "npm.cmd"`` matches nothing and npm reads as missing.
+        """
+        npm_dir = tmp_path / "nodejs"
+        npm_dir.mkdir()
+        npm_cmd = npm_dir / "npm.cmd"
+        npm_cmd.write_text("@echo off\n")
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("NVM_SYMLINK", str(npm_dir))
+        monkeypatch.setenv("PATH", f"%NVM_SYMLINK%{os.pathsep}{tmp_path / 'absent'}")
+
+        assert hermes_managed_node_tree_present() is False
+        assert find_node_executable_on_path("npm") == str(npm_cmd)
+        assert find_node_executable("npm") == str(npm_cmd)
+
 
 
     @pytest.mark.windows_only

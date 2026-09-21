@@ -2247,7 +2247,7 @@ DEFAULT_CONFIG = {
         # request workspace-wide diagnostics (slower).
         "wait_mode": "document",
         "wait_timeout": 5.0,
-        # Missing server binaries: auto = install via npm/go/pip into <HERMES_HOME>/lsp/bin/ on
+        # Missing server binaries: auto = install via npm/go/pip into <root home>/lsp/bin/ on
         # first use; manual = only binaries on PATH; off = alias for manual.
         "install_strategy": "auto",
         # Idle seconds before a server is shut down (respawned on demand), so long- running
