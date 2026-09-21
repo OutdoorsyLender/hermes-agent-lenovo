@@ -210,13 +210,31 @@ staging dir.
 otherwise. The staging tree is a **shared binary cache**, not
 profile data: every profile on the machine reads the same servers,
 so a language server is downloaded once instead of once per profile.
-A profile that already carries its own `lsp/` keeps using it as an
-override, and that override stays inside the profile — its shim is
+The shared tree is consulted **first**; a profile-local `lsp/`
+(what pre-shared-root Hermes wrote) is only a fallback for a package
+the shared tree does not carry, and a profile-local copy that loses
+the resolution is reported once at INFO with both paths. That
+ordering matters: an unvalidated local tree used to win outright, so
+a stale copy — for example a `node_modules` tree npm had resolved to
+an incompatible `latest` — silently took over from a working shared
+server. When a server *is* taken from a profile-local tree it is
 staged under that profile's own `lsp/bin/`, so the shared tree never
 ends up delegating into one profile's private `node_modules`.
 
 Nothing is ever installed to `/usr/local/`, `~/.local/`, or any other
 shared location — the staging dir is fully Hermes-owned.
+
+### TypeScript servers and the SDK they load
+
+`typescript-language-server` does not ship a TypeScript compiler; it
+loads one from its own `node_modules`. Hermes therefore co-installs
+the SDK with the server, pinned to the newest JavaScript-based line
+(`typescript@6`) — `typescript@latest` is the Go-native 7.x port,
+which has no `lib/tsserver.js` and makes the server exit during
+`initialize` with *"Could not find a valid TypeScript installation"*.
+A profile normally needs no configuration for this; pinning
+`lsp.servers.typescript.initialization_options.tsserver.path` is only
+necessary to point at a TypeScript tree of your own.
 
 ## Performance characteristics
 

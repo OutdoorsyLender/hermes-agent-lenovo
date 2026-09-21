@@ -5,9 +5,15 @@ user's global toolchain stays untouched.  That root is the *machine-level* home
 (``get_default_hermes_root()``), not the active profile: the staging tree is a
 re-downloadable binary cache, and a per-profile copy both duplicates the whole
 ``node_modules`` tree and leaves a profile with no server at all whenever only
-one home was ever provisioned.  A profile-local ``lsp/`` (what pre-shared-root
-Hermes wrote) still wins as a read override, and staging it writes beside itself
-so the shared dir never delegates into one profile's private tree.  Strategies:
+one home was ever provisioned.  The shared staging root is therefore the
+authoritative one: it is consulted first, and a profile-local ``lsp/`` (what
+pre-shared-root Hermes wrote) is only a fallback for a package the shared root
+does not carry — so a profile that provisioned its own server keeps it instead
+of re-downloading, but a *stale* profile-local tree can no longer shadow a
+working shared one.  A skipped local tree is logged once, at INFO, with both
+paths.  Staging a server that does live in a profile-local tree writes beside
+it, so the shared dir never delegates into one profile's private tree.
+Strategies:
 ``auto`` (install with the best available package manager), ``manual`` / ``off``
 (probe only; a missing binary skips the server and ``hermes lsp status`` reports
 it).  Installs run synchronously the first time a server is needed, serialized
@@ -42,6 +48,14 @@ def _manual(bin_name: str) -> Dict[str, Any]:
     return _recipe("manual", "", bin_name)
 
 
+# TypeScript 7+ is the Go-native port: no ``lib/tsserver.js`` / ``lib/typescript.js`` and no
+# ``tsserver`` bin, so a JS-based language server cannot load it as its SDK ("Could not find a
+# valid TypeScript installation").  ``typescript`` must therefore never be requested unpinned —
+# ``npm install typescript`` resolves to ``latest``, which is 7.x, and the resulting tree is dead
+# on arrival.  ``typescript@6`` is the newest JavaScript-based line; the pin is also what keeps an
+# existing tree from being silently upgraded into the native one.
+TYPESCRIPT_SDK_PKG = "typescript@6"
+
 # Recipe key → {strategy, pkg, bin[, extra_pkgs]}.  After install we look for
 # ``bin`` in ``<root home>/lsp/bin/`` first, then on PATH.  ``extra_pkgs``
 # are sibling npm packages a server needs in the same node_modules tree.
@@ -49,7 +63,7 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "pyright": _npm("pyright", "pyright-langserver"),
     # tsserver must be importable from the same node_modules tree or
     # initialize() fails with "Could not find a valid TypeScript installation".
-    "typescript-language-server": _npm("typescript-language-server", "typescript-language-server", extra_pkgs=["typescript"]),
+    "typescript-language-server": _npm("typescript-language-server", "typescript-language-server", extra_pkgs=[TYPESCRIPT_SDK_PKG]),
     "@vue/language-server": _npm("@vue/language-server", "vue-language-server"),
     "svelte-language-server": _npm("svelte-language-server", "svelteserver"),
     "@astrojs/language-server": _npm("@astrojs/language-server", "astro-ls"),
@@ -73,6 +87,9 @@ _install_locks: Dict[str, threading.Lock] = {}
 # profile alone, and one process serves many profiles (multiplex gateway / Desktop serve / cron).
 _install_results: Dict[tuple, Optional[str]] = {}
 _install_lock_meta = threading.Lock()
+# (binary, winner root, losing roots) already reported as shadowed — one INFO line each, not one
+# per probe: ``_existing_binary`` runs on every spawn attempt and on every ``hermes lsp status``.
+_shadow_notice_seen: set = set()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
 
@@ -101,18 +118,24 @@ def hermes_lsp_bin_dir() -> Path:
 
 
 def _lsp_staging_roots() -> list[Path]:
-    """Roots to READ, the active profile's own staging dir first, then the shared root.
+    """Roots to READ, the shared staging root first, then the active profile's own dir.
 
-    A profile-local ``lsp/`` is what pre-shared-root Hermes wrote, so a profile that already
-    provisioned its own server keeps resolving it (it wins as an override); every other profile —
-    including one created fresh with an empty ``lsp/`` — falls through to the shared root instead
-    of re-downloading the tree.  Installs always go to the shared root; the only thing written
-    under a profile-local dir is a shim for a server that already lives in that profile's own
-    tree (see ``_bin_dir_for``).
+    The shared root is the canonical, install-owned tree: the installer writes there, so it is the
+    copy Hermes can repair and the one a fresh profile is meant to inherit.  A profile-local
+    ``lsp/`` is what pre-shared-root Hermes wrote, and it is *not* validated before use — a
+    ``node_modules`` tree that npm resolved to an incompatible ``latest`` (the TypeScript 7 native
+    port has no ``tsserver``) or that a package upgrade left half-written is still a directory that
+    exists, so letting it win silently traded a working shared server for a broken private one.
+    It stays as a fallback for a package the shared root does not carry — a box that ever
+    provisioned only a profile keeps working, without re-downloading — and a profile-local tree
+    that loses the resolution is logged once at INFO (see ``_note_shadowed``).
+
+    Installs always go to the shared root; the only thing written under a profile-local dir is a
+    shim for a server that already lives in that profile's own tree (see ``_bin_dir_for``).
     """
     from hermes_constants import get_hermes_home
 
-    roots = [get_hermes_home() / "lsp", hermes_lsp_staging_root()]
+    roots = [hermes_lsp_staging_root(), get_hermes_home() / "lsp"]
     return list({os.path.normcase(str(r)): r for r in roots}.values())
 
 
@@ -184,11 +207,33 @@ def _npm_bin_binary(bin_name: str) -> Optional[Path]:
     return None
 
 
+def _note_shadowed(name: str, winner: Path, roots: list[Path]) -> None:
+    """Log, once per (name, root set), the staging roots that lost the resolution for ``name``.
+
+    Reading the shared root first means a profile-local tree can be ignored; ignoring it silently
+    is how a stale ``typescript@7`` tree stayed invisible until the spawn warning, three layers
+    away.  One INFO line naming both paths makes the dead copy obvious to whoever reads the log.
+    """
+    losers = [r for r in roots
+              if os.path.normcase(str(r)) != os.path.normcase(str(winner))
+              and any(_runnable(c) for c in _native_binary_candidates(r / "bin" / name))]
+    if not losers:
+        return
+    key = (name, os.path.normcase(str(winner)), *(os.path.normcase(str(r)) for r in losers))
+    if key in _shadow_notice_seen:
+        return
+    _shadow_notice_seen.add(key)
+    logger.info("[lsp] %s resolves from %s; an older staging copy in %s is left over and unused",
+                name, winner, ", ".join(str(r) for r in losers))
+
+
 def _existing_binary(name: str) -> Optional[str]:
     """Probe every staging dir + PATH for a binary named ``name``."""
-    for root in _lsp_staging_roots():
+    roots = _lsp_staging_roots()
+    for root in roots:
         for staged in _native_binary_candidates(root / "bin" / name):
             if _runnable(staged):
+                _note_shadowed(name, root, roots)
                 return str(staged)
     suffixes = (".cmd", ".exe", ".bat", "") if _is_windows() else ("",)
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)

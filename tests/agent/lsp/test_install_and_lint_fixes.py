@@ -28,8 +28,42 @@ from agent.lsp.install import INSTALL_RECIPES
 # ---------------------------------------------------------------------------
 
 
+def test_typescript_recipe_pins_the_sdk_to_a_javascript_line(tmp_path, monkeypatch):
+    """The recipe must install the SDK *pinned*, in the same npm command as the server.
 
+    ``npm install typescript`` resolves to ``latest``, and ``latest`` is the Go-native 7.x port:
+    no ``lib/tsserver.js``, no ``tsserver`` bin, so ``initialize`` fails with "Could not find a
+    valid TypeScript installation" and every ``.ts`` write silently loses diagnostics.  An
+    unpinned request is also what a stale profile-local tree (researcher's, ``typescript@7.0.2``)
+    was built from.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
+    from agent.lsp import install as install_mod
+
+    assert install_mod.TYPESCRIPT_SDK_PKG in INSTALL_RECIPES["typescript-language-server"]["extra_pkgs"]
+    assert install_mod.TYPESCRIPT_SDK_PKG.startswith("typescript@")
+    major = int(install_mod.TYPESCRIPT_SDK_PKG.split("@", 1)[1].split(".", 1)[0])
+    assert major < 7, "TypeScript 7+ is the Go-native port and cannot back a JS language server"
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(install_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(install_mod, "find_node_executable", lambda name: "/usr/bin/npm")
+
+    install_mod._install_npm(
+        "typescript-language-server", "typescript-language-server",
+        extra_pkgs=INSTALL_RECIPES["typescript-language-server"]["extra_pkgs"],
+    )
+
+    cmd = captured["cmd"]
+    assert "typescript-language-server" in cmd
+    assert install_mod.TYPESCRIPT_SDK_PKG in cmd
+    assert "typescript" not in cmd, "a bare, unpinned typescript resolves to the 7.x native port"
 
 
 def test_install_npm_works_without_extras(tmp_path, monkeypatch):
