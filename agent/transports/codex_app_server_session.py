@@ -337,13 +337,33 @@ class CodexAppServerSession:
         full turn deadline.
         """
         result = TurnResult()
+        result.submitted_user_text = _coerce_turn_input_text(user_input)
+        try:
+            from tools.effect_policy import EffectDescriptor, EffectMode, PolicyDecision
+            from tools.effect_policy_runtime import enforce_tool_call
+
+            effect_result = enforce_tool_call(
+                "codex_app_server_turn",
+                {
+                    "cwd": self._cwd,
+                    "permission_profile": self._permission_profile,
+                    "input": result.submitted_user_text,
+                },
+                effect_descriptor=EffectDescriptor(mode=EffectMode.OPAQUE),
+            )
+        except Exception as exc:
+            result.error = f"Effect policy denied Codex app-server turn: classification failed: {exc}"
+            return result
+        if effect_result.decision is not PolicyDecision.ALLOW:
+            result.error = f"Effect policy denied Codex app-server turn: {effect_result.reason}"
+            return result
+
         if self._start_for(result):
             # Do not clear first: a hard stop arriving during ensure_started() must
             # be honored before launching a Codex turn.
             if self._interrupt_event.is_set():
                 result.interrupted = True
             else:
-                result.submitted_user_text = _coerce_turn_input_text(user_input)
                 ts = self._request_for(
                     result, "turn/start",
                     {"threadId": self._thread_id, "input": [{"type": "text", "text": result.submitted_user_text}]},

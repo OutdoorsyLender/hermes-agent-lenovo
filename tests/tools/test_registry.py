@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import (
     ToolRegistry,
     _MAX_LOGGED_ERROR_CHARS,
@@ -703,3 +705,38 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+    def test_plugin_cannot_register_into_another_profile_scope(self):
+        reg = ToolRegistry()
+        reg.register_plugin_override_policy(
+            "hermes_plugins.evil", False, scope="profile-a"
+        )
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"
+        ):
+            with pytest.raises(PermissionError, match="profile scope"):
+                reg.register(
+                    name="cross_scope",
+                    toolset="evil",
+                    schema={},
+                    handler=lambda args: "bad",
+                    scope="profile-b",
+                )
+
+    def test_plugin_cannot_dispatch_another_profile_scope(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="profile_tool",
+            toolset="host",
+            schema={},
+            handler=lambda args: "ok",
+            scope="profile-b",
+        )
+        reg.register_plugin_override_policy(
+            "hermes_plugins.evil", False, scope="profile-a"
+        )
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="hermes_plugins.evil"
+        ):
+            with pytest.raises(PermissionError, match="profile scope"):
+                reg.dispatch("profile_tool", {}, scope="profile-b")

@@ -105,6 +105,82 @@ class EffectClassification(str, Enum):
     READ_ONLY_COMPATIBILITY = "read_only_compatibility"
 
 
+class EffectMode(str, Enum):
+    """How a registry registration declares semantic effects."""
+
+    READ_ONLY = "read_only"
+    STATIC = "static"
+    CONDITIONAL = "conditional"
+    OPAQUE = "opaque"
+
+
+HOST_READ_ONLY_TOOL_NAMES = frozenset({
+    "browser_vault_list",
+    "feishu_doc_read",
+    "read_terminal",
+    "read_window_below",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "tool_describe",
+    "tool_search",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class EffectTemplate:
+    """Registration-owned effect independent of request targets."""
+
+    effect: EffectKind
+    resource: ResourceKind
+    mutability: Mutability
+    classification: EffectClassification | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EffectDescriptor:
+    """Immutable security metadata bound to a tool registration.
+
+    ``READ_ONLY`` is an explicit positive declaration. ``STATIC`` emits the
+    supplied templates. ``CONDITIONAL`` invokes one host-owned resolver by key.
+    ``OPAQUE`` represents authority whose eventual effects cannot be proven in
+    process. Remote/plugin payloads may provide data, but never executable
+    resolver callbacks.
+    """
+
+    mode: EffectMode
+    effects: tuple[EffectTemplate, ...] = ()
+    resolver_key: str | None = None
+    version: int = 1
+
+    @classmethod
+    def static(cls, *effects: EffectTemplate) -> "EffectDescriptor":
+        """Build a static descriptor while preserving tuple immutability."""
+        return cls(mode=EffectMode.STATIC, effects=tuple(effects))
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, EffectMode):
+            raise TypeError("effect descriptor mode must be an EffectMode")
+        if not isinstance(self.effects, tuple):
+            raise TypeError("effect descriptor effects must be an immutable tuple")
+        if any(not isinstance(effect, EffectTemplate) for effect in self.effects):
+            raise TypeError("effect descriptor effects must contain EffectTemplate values")
+        if self.version != 1:
+            raise ValueError("unsupported effect descriptor version")
+        if self.mode is EffectMode.STATIC:
+            if not self.effects:
+                raise ValueError("static effect descriptors require at least one effect")
+            if self.resolver_key is not None:
+                raise ValueError("static effect descriptors cannot name a resolver")
+        elif self.mode is EffectMode.CONDITIONAL:
+            if not isinstance(self.resolver_key, str) or not self.resolver_key.strip():
+                raise ValueError("conditional effect descriptors require a resolver key")
+            if self.effects:
+                raise ValueError("conditional effect descriptors cannot contain static effects")
+        elif self.effects or self.resolver_key is not None:
+            raise ValueError(f"{self.mode.value} effect descriptors cannot contain resolver metadata")
+
+
 class IdentityStatus(str, Enum):
     PROVEN = "proven"
     UNKNOWN = "unknown"

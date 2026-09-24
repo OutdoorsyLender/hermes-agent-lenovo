@@ -894,13 +894,18 @@ SKILL_MANAGE_SCHEMA = {
 
 
 # --- Registry ---
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error
 
 registry.register(
     name="skill_manage", toolset="skills", schema=SKILL_MANAGE_SCHEMA, emoji="📝",
     handler=lambda args, **kw: _skill_manage_from(
         args, task_id=kw.get("task_id"), session_id=kw.get("session_id")),
-    dynamic_schema_overrides=_skill_manage_schema_overrides)
+    dynamic_schema_overrides=_skill_manage_schema_overrides,
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="skill_manage",
+    ))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

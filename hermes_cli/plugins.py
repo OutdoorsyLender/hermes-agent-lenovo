@@ -519,20 +519,49 @@ class PluginContext:
         TODO(#64228): swap the per-server allowlist for the declared capability model once it lands
         (per-tool grants, expiry, ro/rw).
         """
-        if server not in self._mcp_allowlist(self.plugin_id):
-            raise PermissionError(
-                f"Plugin {self.manifest.name!r} is not allowed to call MCP "
-                f"server {server!r}. Add it to "
-                f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
-                f"to grant access (default is no MCP access)."
+        with _plugin_home_scope(self._manager.home_path):
+            if server not in self._mcp_allowlist(self.plugin_id):
+                raise PermissionError(
+                    f"Plugin {self.manifest.name!r} is not allowed to call MCP "
+                    f"server {server!r}. Add it to "
+                    f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
+                    f"to grant access (default is no MCP access)."
+                )
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 30.0
+            timeout = max(1.0, min(timeout, 600.0))
+            call_args = dict(arguments or {})
+
+            # Plugin-direct MCP calls must use the caller profile's current
+            # registry manifest and immutable descriptor. This prevents stale or
+            # shared-connection hint metadata from relaxing policy.
+            from tools.mcp_tool_schema import mcp_prefixed_tool_name
+            from tools.registry import registry
+
+            registry_name = mcp_prefixed_tool_name(server, tool)
+            if registry.get_entry(registry_name, scope=self._manager.scope_key) is None:
+                raise PermissionError(
+                    f"MCP tool {server!r}/{tool!r} is not registered for this profile"
+                )
+            raw = registry.dispatch(
+                registry_name,
+                call_args,
+                scope=self._manager.scope_key,
             )
-        try:
-            timeout = float(timeout)
-        except (TypeError, ValueError):
-            timeout = 30.0
-        timeout = max(1.0, min(timeout, 600.0))
-        from tools.mcp_tool_handlers import _make_tool_handler
-        raw = _make_tool_handler(server, tool, timeout)(dict(arguments or {}))
+            try:
+                policy_error = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                policy_error = None
+            if (
+                isinstance(policy_error, dict)
+                and str(policy_error.get("error_type", "")).startswith("effect_policy_")
+            ):
+                raise PermissionError(
+                    f"MCP call {server!r}/{tool!r} was blocked by effect policy: "
+                    f"{policy_error.get('error', 'denied')}"
+                )
         logger.debug("Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
                      self.manifest.name, server, tool, timeout, len(raw or ""))
         return self._mcp_envelope(raw)
@@ -692,7 +721,13 @@ class PluginContext:
             agent = getattr(self._manager._cli_ref, "agent", None)
             if agent is not None:
                 kwargs["parent_agent"] = agent
-        return registry.dispatch(tool_name, args, scope=self._manager.scope_key, **kwargs)
+        with _plugin_home_scope(self._manager.home_path):
+            return registry.dispatch(
+                tool_name,
+                args,
+                scope=self._manager.scope_key,
+                **kwargs,
+            )
 
     @_serialized_replacement
     def register_context_engine(self, engine) -> Optional[PluginRegistration]:
@@ -1888,10 +1923,23 @@ def _dispatch_pre_tool_call_hooks(
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Invoke ``pre_tool_call`` hooks once; return ``(block_message, modified_args)`` — the resolved
     block/approve message (``None`` to proceed) and merged ``modify`` args (``None`` if none)."""
-    details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
-    block_msg = _resolve_block_from_details(
-        details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
-    return (block_msg, details.modified_args)
+    try:
+        details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
+        block_msg = _resolve_block_from_details(
+            details,
+            tool_name,
+            **{
+                key: hook_kwargs.get(key, "")
+                for key in ("turn_id", "tool_call_id", "session_id")
+            },
+        )
+        return (block_msg, details.modified_args)
+    except Exception:
+        logger.exception("pre_tool_call plugin infrastructure failed for %s", tool_name)
+        return (
+            f"BLOCKED: pre_tool_call plugin infrastructure failed for {tool_name}",
+            None,
+        )
 
 
 def get_pre_verify_continue_message(

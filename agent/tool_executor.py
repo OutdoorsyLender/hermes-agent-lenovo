@@ -632,8 +632,12 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
             middleware_trace=list(ref.trace),
         )
         return block_msg, (ref.args if modified_args is None else modified_args)
-    except Exception:
-        return None, ref.args
+    except Exception as exc:
+        logger.exception("pre_tool_call hook infrastructure failed: %s", exc)
+        return (
+            f"BLOCKED: pre_tool_call plugin infrastructure failed for {ref.name}",
+            ref.args,
+        )
 
 
 def _dispatch_authorized_once(
@@ -660,7 +664,18 @@ def _dispatch_authorized_once(
             callback()
 
     block_message, block_error_type = scope_block, "tool_scope_block"
-    if block_message is None:
+    is_connector_envelope = False
+    try:
+        from tools import tool_search as _tool_search
+        underlying, _, error = _tool_search.resolve_underlying_call(ref.args)
+        is_connector_envelope = (
+            ref.name == _tool_search.TOOL_CALL_NAME
+            and error is None
+            and underlying == _tool_search.CONNECTOR_BATCH_SENTINEL
+        )
+    except Exception:
+        is_connector_envelope = False
+    if block_message is None and not is_connector_envelope:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
@@ -676,13 +691,17 @@ def _dispatch_authorized_once(
         state.args = ref.args
 
     guardrail_decision = None
-    if block_message is None:
+    if block_message is None and not is_connector_envelope:
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
         if guardrail_decision.allows_execution:
             guardrail_decision = None
 
     effect_permit = None
-    if block_message is None and guardrail_decision is None:
+    if (
+        block_message is None
+        and guardrail_decision is None
+        and not is_connector_envelope
+    ):
         from tools.effect_policy import PolicyDecision
         from tools.effect_policy_runtime import (
             authorize_and_issue_effect_permit,

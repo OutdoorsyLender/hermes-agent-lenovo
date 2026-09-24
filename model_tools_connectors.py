@@ -8,12 +8,63 @@ from tools.tool_gateway.config import MAX_CALLS_PER_DISPATCH
 from tools.tool_gateway.merge import assemble_results, fill_remote_failure, partition_calls
 
 
-def dispatch_connector_call(name, arguments, tool_call_id):
-    """Transport leg only; the caller owns the normal tool policy pipeline.
+def dispatch_connector_call(
+    name,
+    arguments,
+    tool_call_id,
+    *,
+    task_id=None,
+    session_id=None,
+):
+    """Authorize exact connector arguments immediately before remote transport."""
+    from tools.effect_policy import PolicyDecision
+    from tools.effect_policy_runtime import (
+        authorize_and_issue_effect_permit,
+        bind_issued_effect_permit,
+        consume_effect_permit,
+        effect_policy_error_type,
+    )
 
-    Execution middleware wraps the actual I/O, so connector entries execute
-    individually rather than queuing side effects after a policy callback returns.
-    """
+    consumed = consume_effect_permit(
+        name,
+        arguments,
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+    )
+    if consumed is None:
+        decision, permit = authorize_and_issue_effect_permit(
+            name,
+            arguments,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+        if decision.decision is not PolicyDecision.ALLOW:
+            return tool_error(
+                f"Connector call blocked by effect policy: {decision.reason}",
+                error_type=effect_policy_error_type(decision),
+                policy_decision=decision.decision.value,
+            )
+        if permit is None:
+            return tool_error(
+                "Connector call blocked because no exact effect permit was issued",
+                error_type="effect_policy_denied",
+            )
+        with bind_issued_effect_permit(permit):
+            consumed = consume_effect_permit(
+                name,
+                arguments,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+            )
+        if consumed is None:
+            return tool_error(
+                "Connector call blocked because its effect permit became stale",
+                error_type="effect_policy_stale_authorization",
+            )
+
     from tools.tool_gateway.bridge import run_remote
 
     partition = partition_calls([{"name": name, "arguments": arguments}])

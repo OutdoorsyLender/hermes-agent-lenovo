@@ -12,6 +12,7 @@ elsewhere the agent falls back to ``hermes mcp install <name>`` in the terminal.
 import json
 from typing import Callable, Optional
 
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error
 
 _ACTIONS = ("install", "enable", "authorize")
@@ -105,4 +106,8 @@ registry.register(
         callback=kw.get("callback"),
     ),
     emoji="🔌",
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="setup_mcp",
+    ),
 )

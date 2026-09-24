@@ -85,6 +85,18 @@ def test_read_only_action_table_entries_preserve_compatibility(action):
     assert effect_requests_for_tool("computer_use", {"action": action}, context=_context()) == []
 
 
+def test_read_only_capture_with_bring_to_front_is_control_effect():
+    result = authorize_tool_call(
+        "computer_use",
+        {"action": "capture", "bring_to_front": True},
+        policy=EffectPolicy(
+            denied_effects=frozenset({EffectKind.COMPUTER_CONTROL}),
+        ),
+    )
+
+    assert result.decision is PolicyDecision.DENY
+
+
 def test_action_classification_is_exhaustive_against_runtime_and_schema():
     from tools.computer_use.schema import COMPUTER_USE_SCHEMA
     from tools.computer_use.tool import _ACTIONS
@@ -557,4 +569,43 @@ def test_tool_call_wrapper_authorizes_underlying_computer_use(monkeypatch):
     )
 
     assert result["error_type"] == "effect_policy_denied"
+    assert backend_calls == []
+
+
+def test_computer_use_revalidates_after_legacy_approval(monkeypatch):
+    from tools import effect_policy_runtime as runtime
+    from tools.computer_use import tool as computer_tool
+    from tools.effect_policy import EffectDescriptor, EffectMode
+
+    current_policy = {"value": EffectPolicy()}
+    backend_calls = []
+    monkeypatch.setattr(runtime, "load_effect_policy", lambda: current_policy["value"])
+
+    def approve_and_tighten(*args, **kwargs):
+        current_policy["value"] = EffectPolicy(
+            denied_effects=frozenset({EffectKind.COMPUTER_CONTROL})
+        )
+        return None
+
+    monkeypatch.setattr(computer_tool, "_request_approval", approve_and_tighten)
+    monkeypatch.setattr(
+        computer_tool,
+        "_get_backend",
+        lambda **kwargs: backend_calls.append(kwargs),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        name="computer_use",
+        toolset="test",
+        schema={"name": "computer_use", "description": "test"},
+        handler=computer_tool.handle_computer_use,
+        effect_descriptor=EffectDescriptor(
+            mode=EffectMode.CONDITIONAL,
+            resolver_key="computer_use",
+        ),
+    )
+
+    result = _parsed(registry.dispatch("computer_use", {"action": "click"}))
+
+    assert result["error_type"] == "effect_policy_stale_authorization"
     assert backend_calls == []

@@ -18,6 +18,13 @@ from tools.mcp_tool_handlers import (
 from tools.mcp_tool_schema import (
     _UTILITY_CAPABILITY_ATTRS, _build_utility_schemas, _normalize_name_filter, matches_name_filter)
 from tools.mcp_tool_scope import _key_name, _resolve_server_key, _server_key
+from tools.effect_policy import (
+    EffectDescriptor,
+    EffectKind,
+    EffectTemplate,
+    Mutability,
+    ResourceKind,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from tools.mcp_tool import MCPServerTask
@@ -51,14 +58,27 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     return hint is True
 
 
+def _mcp_effect_descriptor(*, read_only: bool) -> EffectDescriptor:
+    """Bind host-captured MCP mutability into immutable registry metadata."""
+    return EffectDescriptor.static(EffectTemplate(
+        effect=EffectKind.MCP_READ if read_only else EffectKind.MCP_MUTATE,
+        resource=ResourceKind.MCP,
+        mutability=Mutability.READ_ONLY if read_only else Mutability.MUTATING,
+    ))
+
+
 def _record_tool_trust_metadata(server_name: str, config: dict, tools: List[Any]) -> None:
     """Capture per-server trust and per-tool readOnlyHint at discovery — the security boundary: the call-time gate
     classifies from data we control, never re-read server-supplied state."""
     with _core._lock:
         key = _resolve_server_key(server_name)
         _core._server_trust_levels[key] = _normalize_server_trust((config or {}).get("trust"))
-        hints = _core._tool_read_only_hints.setdefault(key, {})
-        hints.update({t.name: _annotation_read_only_hint(t) for t in tools if getattr(t, "name", None)})
+        trusted_hints = (config or {}).get("trust_read_only_hints") is True
+        _core._tool_read_only_hints[key] = {
+            t.name: trusted_hints and _annotation_read_only_hint(t)
+            for t in tools
+            if getattr(t, "name", None)
+        }
 
 
 def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
@@ -229,14 +249,21 @@ class _Candidate:
     origin: str
     schema: dict
     handler: Callable
+    effect_descriptor: EffectDescriptor
 
     @property
     def is_utility(self) -> bool:
         return self.origin.startswith(_UTILITY_ORIGIN_PREFIX)
 
 
-def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[[str], bool],
-                     tool_timeout) -> List[_Candidate]:
+def _tool_candidates(
+    name: str,
+    tools: Iterable[Any],
+    should_register: Callable[[str], bool],
+    tool_timeout,
+    *,
+    trust_read_only_hints: bool = False,
+) -> List[_Candidate]:
     """Native tools (live SDK objects or cache stand-ins) -> candidates. The injection scan runs on
     BOTH paths: the cache file is user-writable JSON."""
     out: List[_Candidate] = []
@@ -247,7 +274,17 @@ def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[
         _schema._scan_mcp_description(name, t.name, t.description or "")
         schema = _schema._convert_mcp_schema(name, t)
         handler = _handlers._make_tool_handler(name, t.name, tool_timeout)
-        out.append(_Candidate(schema["name"], f"tool {t.name!r}", schema, handler))
+        out.append(_Candidate(
+            schema["name"],
+            f"tool {t.name!r}",
+            schema,
+            handler,
+            _mcp_effect_descriptor(
+                read_only=(
+                    trust_read_only_hints and _annotation_read_only_hint(t)
+                )
+            ),
+        ))
     return out
 
 
@@ -257,8 +294,13 @@ def _utility_candidates(name: str, entries: Iterable[Any], tool_timeout) -> List
     for raw in entries:
         schema, key = (raw.get("schema"), raw.get("handler_key")) if isinstance(raw, dict) else (None, None)
         if isinstance(schema, dict) and key in _UTILITY_HANDLER_FACTORIES and schema.get("name"):
-            out.append(_Candidate(schema["name"], f"{_UTILITY_ORIGIN_PREFIX}{key!r}", schema,
-                                  _UTILITY_HANDLER_FACTORIES[key](name, tool_timeout)))
+            out.append(_Candidate(
+                schema["name"],
+                f"{_UTILITY_ORIGIN_PREFIX}{key!r}",
+                schema,
+                _UTILITY_HANDLER_FACTORIES[key](name, tool_timeout),
+                _mcp_effect_descriptor(read_only=True),
+            ))
     return out
 
 
@@ -333,7 +375,9 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
             continue
         registry.register(
             name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=c.handler, check_fn=check_fn,
-            is_async=False, description=c.schema.get("description") or "", scope=scope_value)
+            is_async=False, description=c.schema.get("description") or "", scope=scope_value,
+            effect_descriptor=c.effect_descriptor,
+        )
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
             if scope_value is not None:
@@ -385,7 +429,13 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     should_register = _make_tool_filter(name, config)
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools)
-    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
+    candidates = _tool_candidates(
+        name,
+        server._tools,
+        should_register,
+        server.tool_timeout,
+        trust_read_only_hints=config.get("trust_read_only_hints") is True,
+    )
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
@@ -472,7 +522,13 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             _core._server_tool_scopes.setdefault(key, set()).add(scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue
-        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
+        candidates = _tool_candidates(
+            name,
+            server._tools,
+            _make_tool_filter(name, config),
+            server.tool_timeout,
+            trust_read_only_hints=config.get("trust_read_only_hints") is True,
+        )
         candidates += _utility_candidates(
             name, _select_utility_schemas(name, server, config), server.tool_timeout)
         names = _register_candidates(
@@ -498,7 +554,13 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
-    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
+    candidates = _tool_candidates(
+        name,
+        cached_tools,
+        _make_tool_filter(name, config),
+        tool_timeout,
+        trust_read_only_hints=config.get("trust_read_only_hints") is True,
+    )
     candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)

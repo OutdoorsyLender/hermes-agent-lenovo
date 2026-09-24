@@ -182,6 +182,30 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_effect_policy_denies_before_app_server_start(self, monkeypatch):
+        from tools import effect_policy_runtime as runtime
+        from tools.effect_policy import EffectKind, EffectPolicy
+
+        client = FakeClient()
+        session = make_session(client)
+        monkeypatch.setattr(
+            runtime,
+            "load_effect_policy",
+            lambda: EffectPolicy(denied_effects=frozenset({EffectKind.PROCESS_EXECUTE})),
+        )
+
+        result = session.run_turn(
+            "do not execute",
+            turn_timeout=0.01,
+            notification_poll_timeout=0.001,
+            post_tool_quiet_timeout=0.01,
+        )
+
+        assert result.error is not None
+        assert "effect policy denied" in result.error.lower()
+        assert client._initialized is False
+        assert client.requests == []
+
 
 # ---- turn loop ----
 

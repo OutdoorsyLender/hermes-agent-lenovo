@@ -355,6 +355,24 @@ def _run_job_script(
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
         # gateway sessions (#69396).
+        from tools.effect_policy import EffectDescriptor, EffectMode, PolicyDecision
+        from tools.effect_policy_runtime import EffectContext, enforce_tool_call
+
+        effect_result = enforce_tool_call(
+            "cron_script",
+            {"argv": argv, "workdir": workdir or str(path.parent)},
+            context=EffectContext(
+                actor="cron",
+                profile="",
+                session_mode="cron",
+                execution_mode="unattended",
+                unattended=True,
+            ),
+            effect_descriptor=EffectDescriptor(mode=EffectMode.OPAQUE),
+        )
+        if effect_result.decision is not PolicyDecision.ALLOW:
+            return False, f"Effect policy denied cron script execution: {effect_result.reason}"
+
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)

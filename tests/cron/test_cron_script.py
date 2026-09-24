@@ -107,6 +107,31 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_effect_policy_denies_before_script_spawn(self, cron_env, monkeypatch):
+        from cron import scheduler_script as sched_script
+        from tools import effect_policy_runtime as runtime
+        from tools.effect_policy import EffectKind, EffectPolicy
+
+        script = cron_env / "scripts" / "blocked.py"
+        script.write_text('print("must not run")\n')
+        monkeypatch.setattr(
+            runtime,
+            "load_effect_policy",
+            lambda: EffectPolicy(denied_effects=frozenset({EffectKind.PROCESS_EXECUTE})),
+        )
+        spawned = []
+        monkeypatch.setattr(
+            sched_script.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: spawned.append(True),
+        )
+
+        success, output = sched_script._run_job_script("blocked.py")
+
+        assert success is False
+        assert "effect policy denied" in output.lower()
+        assert spawned == []
+
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""

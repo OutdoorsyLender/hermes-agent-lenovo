@@ -51,6 +51,7 @@ _HOOK_CALLER_THREAD_HOOKS: Set[str] = {"subagent_stop"}
 # After a timeout, suppress the same callback this long so a hung hook cannot pile up threads.
 _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+_PRE_TOOL_CALL_FAILURE_BLOCK_MESSAGE = "pre_tool_call plugin callback failed"
 
 # System-prompt sections are tightly bounded: they become high-trust prompt bytes charged every turn.
 SYSTEM_PROMPT_SECTION_POSITIONS = frozenset({"after_memory"})
@@ -202,6 +203,11 @@ class PluginDispatchMixin:
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                if fail_closed:
+                    results.append({
+                        "action": "block",
+                        "message": _PRE_TOOL_CALL_FAILURE_BLOCK_MESSAGE,
+                    })
         return results
 
     def _run_hook_callback_bounded(

@@ -2077,6 +2077,7 @@ process_registry = ProcessRegistry()
 
 
 # --- the "process_manage" tool schema + handler -----------------------------------
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error
 
 PROCESS_SCHEMA = {
@@ -2225,6 +2226,32 @@ def _handle_process(args, **kw):
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+
+    from tools.effect_policy import PolicyDecision
+    from tools.effect_policy_runtime import (
+        effect_policy_block_message,
+        effect_policy_error_type,
+        enforce_final_effect_admission,
+    )
+    final_policy = enforce_final_effect_admission(
+        "process_manage",
+        args,
+        task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
+        tool_call_id=kw.get("tool_call_id"),
+        effect_descriptor=EffectDescriptor(
+            mode=EffectMode.CONDITIONAL,
+            resolver_key="process_manage",
+        ),
+    )
+    if final_policy.decision is not PolicyDecision.ALLOW:
+        return tool_error(
+            effect_policy_block_message(final_policy)
+            or "Effect policy blocked process management before execution.",
+            error_type=effect_policy_error_type(final_policy),
+            policy_decision=final_policy.decision.value,
+        )
+
     if action == "list":
         return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
     if action == "handoff":
@@ -2234,6 +2261,19 @@ def _handle_process(args, **kw):
     if action in _SESSION_ACTIONS:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        session = process_registry.get(session_id)
+        if session is None:
+            return json.dumps(_not_found(session_id), ensure_ascii=False)
+        owner = str(session.owner_task_id or "")
+        caller = str(kw.get("task_id") or "")
+        if owner and caller != owner:
+            return tool_error(
+                f"Process {session.id} is not owned by task {caller or '<unknown>'}; "
+                "use the owning task or an explicit handoff."
+            )
+        # Resolve a short prefix once, then dispatch by the full immutable id so a
+        # second lookup cannot select a different session.
+        session_id = session.id
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
@@ -2246,6 +2286,10 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="process_manage",
+    ),
 )
 
 

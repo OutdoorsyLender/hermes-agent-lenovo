@@ -175,8 +175,13 @@ def test_direct_missing_task_id_uses_carrier_default_workspace(monkeypatch, tmp_
     )
 
     assert result == {"ok": True}
-    assert seen == ["default"]
-    assert dispatched == [{"task_id": None, "session_id": None, "user_task": None}]
+    assert seen and set(seen) == {"default"}
+    assert dispatched == [{
+        "task_id": None,
+        "session_id": None,
+        "user_task": None,
+        "tool_call_id": None,
+    }]
 
 
 def test_inner_policy_block_is_reported_as_blocked_to_observers():
@@ -537,6 +542,44 @@ def test_effect_permit_reauthorizes_when_live_policy_changes(monkeypatch, tmp_pa
     assert result["error_type"] == "effect_policy_denied"
     assert dispatched == []
     assert not target.exists()
+
+
+def test_direct_model_dispatch_rejects_policy_change_during_approval(monkeypatch, tmp_path):
+    current_policy = {
+        "value": EffectPolicy(
+            approval_required_effects=frozenset({EffectKind.WRITE})
+        )
+    }
+    monkeypatch.setattr(
+        "tools.effect_policy_runtime.load_effect_policy",
+        lambda: current_policy["value"],
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: dispatched.append((args, kwargs)) or {"ok": True},
+    )
+
+    def approve_and_tighten(*args, **kwargs):
+        current_policy["value"] = EffectPolicy(
+            denied_effects=frozenset({EffectKind.WRITE})
+        )
+        return {"approved": True}
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", approve_and_tighten)
+    result = _parsed(
+        model_tools.handle_function_call(
+            "write_file",
+            {"path": str(tmp_path / "blocked.txt"), "content": "payload"},
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+    )
+
+    assert result["error_type"] == "effect_policy_stale_authorization"
+    assert dispatched == []
 
 
 def test_effect_permit_cannot_be_self_issued_with_an_empty_policy(monkeypatch, tmp_path):

@@ -255,6 +255,32 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     for scope in scopes:
         if (err := _request_approval(scope, args, session_id)) is not None:
             return err
+    from tools.effect_policy import EffectDescriptor, EffectMode, PolicyDecision
+    from tools.effect_policy_runtime import (
+        effect_policy_block_message,
+        effect_policy_error_type,
+        enforce_final_effect_admission,
+    )
+    from tools.registry import tool_error
+
+    final_policy = enforce_final_effect_admission(
+        "computer_use",
+        args,
+        task_id=kwargs.get("task_id"),
+        session_id=kwargs.get("session_id"),
+        tool_call_id=kwargs.get("tool_call_id"),
+        effect_descriptor=EffectDescriptor(
+            mode=EffectMode.CONDITIONAL,
+            resolver_key="computer_use",
+        ),
+    )
+    if final_policy.decision is not PolicyDecision.ALLOW:
+        return tool_error(
+            effect_policy_block_message(final_policy)
+            or "Effect policy blocked computer_use before execution",
+            error_type=effect_policy_error_type(final_policy),
+            policy_decision=final_policy.decision.value,
+        )
     try:
         backend = _get_backend(session_id=session_id)
     except Exception as e:

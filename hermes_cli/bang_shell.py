@@ -74,13 +74,15 @@ def check_bang_approval(command: str) -> dict:
     Reuses ``tools.terminal_tool._check_all_guards`` — exactly what ``terminal_tool()`` calls — so the
     hardline blocklist, user deny rules, tirith findings, and the dangerous-command prompt all apply
     to user-typed bang commands too. Returns the gate's ``{"approved": bool, "message": ...}``;
-    falls back to *approved* only when the gate itself cannot be imported (a broken install, not a
-    policy decision).
+    a missing or broken approval gate denies the command.
     """
     try:
         from tools.terminal_tool import _check_all_guards
-    except Exception:
-        return {"approved": True, "message": None}
+    except Exception as exc:
+        return {
+            "approved": False,
+            "message": f"Bang command blocked: approval guard unavailable ({exc}).",
+        }
 
     # Bang commands always run locally in the CLI process, never inside a remote/sandbox backend.
     return _check_all_guards(command, "local", has_host_access=False)
@@ -113,6 +115,29 @@ def run_bang_command(command: str, *, cwd: Optional[str] = None, timeout: int = 
         creationflags = windows_hide_flags()
     except Exception:
         creationflags = 0
+
+    # Authorize at the irreversible boundary as an opaque local process carrier.
+    # This intentionally does not claim to resolve shell aliases, scripts, nested
+    # interpreters, or descendant behavior.
+    try:
+        from tools.effect_policy import EffectDescriptor, EffectMode, PolicyDecision
+        from tools.effect_policy_runtime import enforce_tool_call
+
+        decision = enforce_tool_call(
+            "terminal",
+            {"command": command, "workdir": run_cwd},
+            effect_descriptor=EffectDescriptor(
+                mode=EffectMode.CONDITIONAL,
+                resolver_key="terminal",
+            ),
+        )
+    except Exception as exc:
+        emit(f"!: command blocked: effect policy unavailable ({exc})")
+        return 126
+    if decision.decision is not PolicyDecision.ALLOW:
+        emit(f"!: command blocked by effect policy: {decision.reason}")
+        return 126
+
     try:
         # shell=True is intentional (matches quick_commands): the human typed this, not the model.
         proc = subprocess.Popen(

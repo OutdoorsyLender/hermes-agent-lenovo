@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
+from tools.effect_policy import (
+    EffectDescriptor,
+    EffectMode,
+    HOST_READ_ONLY_TOOL_NAMES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +181,7 @@ class ToolEntry:
     is_async: bool
     description: str
     emoji: str
+    effect_descriptor: EffectDescriptor
     max_result_size_chars: int | float | None = None
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
@@ -192,12 +198,14 @@ class ToolDispatchIdentity:
     approval_scope_id: str
     handler: Callable
     is_async: bool
+    effect_descriptor: EffectDescriptor
 
     @property
     def approval_scope_key(self) -> str:
-        """Opaque scope that changes with registration or handler identity."""
+        """Opaque scope that changes with registration, handler, or effects."""
         payload = (
-            f"{self.approval_scope_id}:{id(self.handler)}:{int(self.is_async)}"
+            f"{self.approval_scope_id}:{id(self.handler)}:{int(self.is_async)}:"
+            f"{self.effect_descriptor!r}"
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
@@ -210,6 +218,7 @@ class ToolDispatchIdentity:
             and self.approval_scope_id == other.approval_scope_id
             and self.handler is other.handler
             and self.is_async is other.is_async
+            and self.effect_descriptor == other.effect_descriptor
         )
 
 
@@ -505,6 +514,7 @@ class ToolRegistry:
                 approval_scope_id=approval_scope_id,
                 handler=entry.handler,
                 is_async=entry.is_async,
+                effect_descriptor=entry.effect_descriptor,
             )
 
     def is_current_dispatch_identity(
@@ -673,7 +683,9 @@ class ToolRegistry:
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
-        dynamic_schema_overrides: Callable = None, override: bool = False,
+        dynamic_schema_overrides: Callable = None,
+        effect_descriptor: EffectDescriptor | None = None,
+        override: bool = False,
         scope: Optional[str] = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
@@ -681,6 +693,15 @@ class ToolRegistry:
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
+        if owner is not None:
+            with self._lock:
+                owner_scopes = set(self._plugin_module_scopes.get(owner, set()))
+            if scope is not None and scope not in owner_scopes:
+                raise PermissionError(
+                    f"Plugin {owner!r} cannot register outside its durable profile scope"
+                )
+        if effect_descriptor is not None and not isinstance(effect_descriptor, EffectDescriptor):
+            raise TypeError("effect_descriptor must be an EffectDescriptor")
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         with self._lock:
@@ -726,6 +747,17 @@ class ToolRegistry:
                 name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
+                effect_descriptor=(
+                    effect_descriptor
+                    if effect_descriptor is not None
+                    else EffectDescriptor(
+                        mode=(
+                            EffectMode.READ_ONLY
+                            if owner is None and name in HOST_READ_ONLY_TOOL_NAMES
+                            else EffectMode.OPAQUE
+                        )
+                    )
+                ),
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
@@ -891,32 +923,54 @@ class ToolRegistry:
 
     def dispatch(
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
-        """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
-        results normalized, every exception returned as ``{"error": ...}``.
+        """Authorize final arguments and execute one captured registry handler.
 
-        Phase 2A makes this the checked boundary for ``computer_use`` so direct
-        registry and plugin dispatch cannot bypass semantic authorization.
+        Every registration carries immutable effect metadata. Missing metadata is
+        represented as opaque authority, so direct registry and plugin dispatch
+        cannot bypass policy by avoiding the agent/model seams.
         """
+        caller_owner = self._plugin_namespace_of_module(self._caller_module())
+        if caller_owner is not None and scope is not None:
+            with self._lock:
+                owner_scopes = set(
+                    self._plugin_module_scopes.get(caller_owner, set())
+                )
+            if scope not in owner_scopes:
+                raise PermissionError(
+                    f"Plugin {caller_owner!r} cannot dispatch outside its durable profile scope"
+                )
         dispatch_identity = self.snapshot_dispatch_identity(name, scope=scope)
         if dispatch_identity is None:
             return tool_error(f"Unknown tool: {name}")
-        entry = dispatch_identity.entry
-        dispatch_args = args
-        if name == "computer_use":
-            try:
-                from tools.effect_policy import PolicyDecision
-                from tools.effect_policy_runtime import (
-                    _args_digest,
-                    consume_effect_permit,
-                    effect_policy_block_message,
-                    enforce_tool_call,
-                    snapshot_effect_args,
-                    snapshot_effect_authorization,
-                )
+        try:
+            from tools.effect_policy import PolicyDecision
+            from tools.effect_policy_runtime import (
+                _args_digest,
+                bind_final_effect_admission,
+                capture_final_effect_admission,
+                consume_effect_permit,
+                effect_policy_block_message,
+                enforce_tool_call,
+                snapshot_effect_args,
+                snapshot_effect_authorization,
+            )
 
-                dispatch_args = snapshot_effect_args(args)
-                authorized_args_digest = _args_digest(dispatch_args)
-                permit = consume_effect_permit(
+            dispatch_args = snapshot_effect_args(args)
+            authorized_args_digest = _args_digest(dispatch_args)
+            permit = consume_effect_permit(
+                name,
+                dispatch_args,
+                task_id=kwargs.get("task_id"),
+                session_id=kwargs.get("session_id"),
+                tool_call_id=kwargs.get("tool_call_id"),
+                registration_identity=dispatch_identity,
+            )
+            direct_admission = None
+            if permit is None:
+                live_policy, live_context, admission_fingerprint = (
+                    snapshot_effect_authorization()
+                )
+                direct_admission = capture_final_effect_admission(
                     name,
                     dispatch_args,
                     task_id=kwargs.get("task_id"),
@@ -924,87 +978,121 @@ class ToolRegistry:
                     tool_call_id=kwargs.get("tool_call_id"),
                     registration_identity=dispatch_identity,
                 )
-                if permit is None:
-                    live_policy, live_context, authorization_fingerprint = (
-                        snapshot_effect_authorization()
+                if direct_admission.authorization_fingerprint != admission_fingerprint:
+                    return tool_error(
+                        f"Effect policy blocked {name} because policy or context changed "
+                        "before authorization. Retry under the current policy.",
+                        error_type="effect_policy_stale_authorization",
                     )
-                    policy_result = enforce_tool_call(
-                        name,
-                        dispatch_args,
-                        task_id=kwargs.get("task_id"),
-                        context=live_context,
-                        policy=live_policy,
-                        approval_scope_id=dispatch_identity.approval_scope_key,
+                policy_result = enforce_tool_call(
+                    name,
+                    dispatch_args,
+                    task_id=kwargs.get("task_id"),
+                    context=live_context,
+                    policy=live_policy,
+                    approval_scope_id=dispatch_identity.approval_scope_key,
+                    effect_descriptor=dispatch_identity.effect_descriptor,
+                )
+                if policy_result.decision is not PolicyDecision.ALLOW:
+                    error_type = (
+                        "effect_policy_denied"
+                        if policy_result.decision is PolicyDecision.DENY
+                        else "effect_policy_approval_required"
                     )
-                    if policy_result.decision is not PolicyDecision.ALLOW:
-                        error_type = (
-                            "effect_policy_denied"
-                            if policy_result.decision is PolicyDecision.DENY
-                            else "effect_policy_approval_required"
-                        )
-                        return tool_error(
-                            effect_policy_block_message(policy_result)
-                            or "Effect policy blocked this operation.",
-                            error_type=error_type,
-                            policy_decision=policy_result.decision.value,
-                        )
-                    if _args_digest(dispatch_args) != authorized_args_digest:
-                        return tool_error(
-                            "Effect policy blocked computer_use because its arguments changed "
-                            "during authorization. Retry the operation.",
-                            error_type="effect_policy_arguments_changed",
-                        )
-                    _, _, current_fingerprint = snapshot_effect_authorization()
-                    if current_fingerprint != authorization_fingerprint:
-                        return tool_error(
-                            "Effect policy blocked computer_use because policy or context changed "
-                            "during authorization. Retry under the current policy.",
-                            error_type="effect_policy_stale_authorization",
-                        )
-                # Execute only the captured handler. Replacement, restoration,
-                # or in-place handler mutation after authorization invalidates
-                # the identity rather than switching implementations.
+                    return tool_error(
+                        effect_policy_block_message(policy_result)
+                        or "Effect policy blocked this operation.",
+                        error_type=error_type,
+                        policy_decision=policy_result.decision.value,
+                    )
+                if _args_digest(dispatch_args) != authorized_args_digest:
+                    return tool_error(
+                        f"Effect policy blocked {name} because its arguments changed "
+                        "during authorization. Retry the operation.",
+                        error_type="effect_policy_arguments_changed",
+                    )
+                post_admission = capture_final_effect_admission(
+                    name,
+                    dispatch_args,
+                    task_id=kwargs.get("task_id"),
+                    session_id=kwargs.get("session_id"),
+                    tool_call_id=kwargs.get("tool_call_id"),
+                    registration_identity=dispatch_identity,
+                )
+                if (
+                    direct_admission is None
+                    or post_admission.authorization_fingerprint
+                    != direct_admission.authorization_fingerprint
+                    or post_admission.effects_digest != direct_admission.effects_digest
+                    or post_admission.args_digest != direct_admission.args_digest
+                    or post_admission.registration_identity
+                    != direct_admission.registration_identity
+                ):
+                    return tool_error(
+                        f"Effect policy blocked {name} because its authorized effects "
+                        "changed before execution. Retry the operation.",
+                        error_type="effect_policy_stale_authorization",
+                    )
+                direct_admission = post_admission
+            else:
+                admission_fingerprint = permit.authorization_fingerprint
+
+            _, _, current_fingerprint = snapshot_effect_authorization()
+            if current_fingerprint != admission_fingerprint:
+                return tool_error(
+                    f"Effect policy blocked {name} because policy or context changed "
+                    "during authorization. Retry under the current policy.",
+                    error_type="effect_policy_stale_authorization",
+                )
+            if not self.is_current_dispatch_identity(
+                name, dispatch_identity, scope=scope
+            ):
+                return tool_error(
+                    f"Effect policy blocked {name} because its registration changed "
+                    "during authorization. Retry to authorize the current registration.",
+                    error_type="effect_policy_registration_changed",
+                )
+        except Exception as exc:
+            return tool_error(
+                f"Effect policy DENIED: {name} authorization failed: {exc}. "
+                "The operation was not executed.",
+                error_type="effect_policy_denied",
+                policy_decision="deny",
+            )
+        try:
+            execution_handler = dispatch_identity.handler
+            execution_is_async = dispatch_identity.is_async
+            # Final admission captures the exact registration and policy epoch.
+            # The lock is released before tool code runs; already-admitted calls
+            # are not claimed to be revocable OS-level leases.
+            with self._lock:
                 if not self.is_current_dispatch_identity(
                     name, dispatch_identity, scope=scope
                 ):
                     return tool_error(
-                        "Effect policy blocked computer_use because its registration changed "
-                        "during authorization. Retry to authorize the current registration.",
+                        f"Effect policy blocked {name} because its registration changed "
+                        "before execution. Retry to authorize the current registration.",
                         error_type="effect_policy_registration_changed",
                     )
-            except Exception as exc:
+                _, _, final_fingerprint = snapshot_effect_authorization()
+                if final_fingerprint != admission_fingerprint:
+                    return tool_error(
+                        f"Effect policy blocked {name} because policy or context changed "
+                        "before execution. Retry under the current policy.",
+                        error_type="effect_policy_stale_authorization",
+                    )
+            final_admission = permit or direct_admission
+            if final_admission is None:  # pragma: no cover - defensive invariant
                 return tool_error(
-                    f"Effect policy DENIED: computer_use authorization failed: {exc}. "
-                    "The operation was not executed.",
+                    f"Effect policy blocked {name}: final admission was unavailable.",
                     error_type="effect_policy_denied",
-                    policy_decision="deny",
                 )
-        try:
-            execution_handler = (
-                dispatch_identity.handler if name == "computer_use" else entry.handler
-            )
-            execution_is_async = (
-                dispatch_identity.is_async if name == "computer_use" else entry.is_async
-            )
-            if name == "computer_use":
-                # The successful identity check plus captured handler establishes
-                # the execution lease. Release the registry-wide lock before
-                # invoking tool code so unrelated dispatch and async overrides
-                # cannot block or deadlock on registry access.
-                with self._lock:
-                    if not self.is_current_dispatch_identity(
-                        name, dispatch_identity, scope=scope
-                    ):
-                        return tool_error(
-                            "Effect policy blocked computer_use because its registration changed "
-                            "before execution. Retry to authorize the current registration.",
-                            error_type="effect_policy_registration_changed",
-                        )
-            if execution_is_async:
-                from model_tools import _run_async
-                result = _run_async(execution_handler(dispatch_args, **kwargs))
-            else:
-                result = execution_handler(dispatch_args, **kwargs)
+            with bind_final_effect_admission(final_admission):
+                if execution_is_async:
+                    from model_tools import _run_async
+                    result = _run_async(execution_handler(dispatch_args, **kwargs))
+                else:
+                    result = execution_handler(dispatch_args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

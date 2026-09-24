@@ -447,7 +447,22 @@ def check_web_api_key() -> bool:
 
 
 # ─── Registry ─────────────────────────────────────────────────────────────────
+from tools.effect_policy import (
+    EffectDescriptor,
+    EffectKind,
+    EffectTemplate,
+    Mutability,
+    ResourceKind,
+)
 from tools.registry import registry, tool_error
+
+_NETWORK_READ_DESCRIPTOR = EffectDescriptor.static(
+    EffectTemplate(
+        effect=EffectKind.NETWORK_READ,
+        resource=ResourceKind.NETWORK,
+        mutability=Mutability.READ_ONLY,
+    )
+)
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -498,6 +513,7 @@ registry.register(
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), emoji="🔍",
     max_result_size_chars=100_000,
+    effect_descriptor=_NETWORK_READ_DESCRIPTOR,
 )
 registry.register(
     name="web_extract", toolset="web", schema=WEB_EXTRACT_SCHEMA,
@@ -507,6 +523,7 @@ registry.register(
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
     max_result_size_chars=100_000,
+    effect_descriptor=_NETWORK_READ_DESCRIPTOR,
 )
 
 

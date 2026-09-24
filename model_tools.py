@@ -769,7 +769,10 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            logger.exception("pre_tool_call hook infrastructure failed: %s", _hook_err)
+            block_message = (
+                f"BLOCKED: pre_tool_call plugin infrastructure failed for {function_name}"
+            )
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -823,40 +826,79 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         # pre-tool argument rewrites. Direct callers are authorized here; the
         # agent executor supplies a one-shot permit bound to the same final
         # arguments after authorizing at its corresponding seam.
-        from tools.effect_policy_runtime import consume_effect_permit
+        from tools.effect_policy_runtime import (
+            authorize_and_issue_effect_permit,
+            bind_issued_effect_permit,
+            consume_effect_permit,
+            relay_effect_permit,
+        )
 
-        # ``computer_use`` defers consumption to ToolRegistry.dispatch, where
-        # the permit can be checked against the exact ToolEntry registration.
-        # That same boundary authorizes direct registry/plugin dispatches.
-        if function_name != "computer_use" and consume_effect_permit(
+        # Consume the outer permit at this post-middleware seam, then relay a
+        # fresh one-shot permit to the final registry/connector boundary. This
+        # preserves one-shot call identity while letting the final boundary bind
+        # the exact handler or transport.
+        from tools.tool_gateway.names import is_connector_name
+        connector_tool = is_connector_name(function_name)
+        registration_identity = registry.snapshot_dispatch_identity(function_name)
+        registered_tool = registration_identity is not None
+        final_permit = None
+        consumed = consume_effect_permit(
             function_name,
             next_args,
             task_id=ids.task_id,
             session_id=ids.session_id,
             tool_call_id=ids.tool_call_id,
-        ) is None:
+            registration_identity=(registration_identity if registered_tool else None),
+        )
+        if consumed is None:
             from tools.effect_policy import PolicyDecision
             from tools.effect_policy_runtime import effect_policy_block_message, enforce_tool_call
 
-            policy_result = enforce_tool_call(function_name, next_args, task_id=ids.task_id)
+            if registered_tool or connector_tool:
+                policy_result, final_permit = authorize_and_issue_effect_permit(
+                    function_name,
+                    next_args,
+                    task_id=ids.task_id,
+                    session_id=ids.session_id,
+                    tool_call_id=ids.tool_call_id,
+                )
+            else:
+                policy_result = enforce_tool_call(
+                    function_name,
+                    next_args,
+                    task_id=ids.task_id,
+                )
             if policy_result.decision is not PolicyDecision.ALLOW:
+                stale = "changed during authorization" in policy_result.reason
                 error_type = (
-                    "effect_policy_denied"
-                    if policy_result.decision is PolicyDecision.DENY
-                    else "effect_policy_approval_required"
+                    "effect_policy_stale_authorization"
+                    if stale
+                    else (
+                        "effect_policy_denied"
+                        if policy_result.decision is PolicyDecision.DENY
+                        else "effect_policy_approval_required"
+                    )
                 )
                 return tool_error(
                     effect_policy_block_message(policy_result) or "Effect policy blocked this operation.",
                     error_type=error_type,
                     policy_decision=policy_result.decision.value,
                 )
-        from tools.tool_gateway.names import is_connector_name
-        if is_connector_name(function_name):
-            from model_tools_connectors import dispatch_connector_call
-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        if function_name == "computer_use":
-            dispatch_kwargs["tool_call_id"] = ids.tool_call_id
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        elif registered_tool or connector_tool:
+            final_permit = relay_effect_permit(consumed)
+        if connector_tool:
+            with bind_issued_effect_permit(final_permit):
+                from model_tools_connectors import dispatch_connector_call
+                return dispatch_connector_call(
+                    function_name,
+                    next_args,
+                    ids.tool_call_id,
+                    task_id=ids.task_id,
+                    session_id=ids.session_id,
+                )
+        dispatch_kwargs["tool_call_id"] = ids.tool_call_id
+        with bind_issued_effect_permit(final_permit):
+            return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

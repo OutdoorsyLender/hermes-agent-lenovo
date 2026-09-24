@@ -89,6 +89,40 @@ class TestBangContextGating:
 # ── execution ──────────────────────────────────────────────────────────────
 
 class TestBangExecution:
+    def test_effect_policy_denies_before_popen(self, monkeypatch):
+        from tools.effect_policy import EffectKind, EffectPolicy
+        from tools import effect_policy_runtime as runtime
+
+        monkeypatch.setattr(
+            runtime,
+            "load_effect_policy",
+            lambda: EffectPolicy(denied_effects=frozenset({EffectKind.PROCESS_EXECUTE})),
+        )
+        popen = MagicMock()
+        monkeypatch.setattr("hermes_cli.bang_shell.subprocess.Popen", popen)
+        lines = []
+
+        code = run_bang_command("echo blocked", writer=lines.append)
+
+        assert code == 126
+        popen.assert_not_called()
+        assert any("effect policy" in line.lower() for line in lines)
+
+    def test_invalid_effect_policy_denies_before_popen(self, monkeypatch):
+        from tools.effect_policy import EffectPolicy
+        from tools import effect_policy_runtime as runtime
+
+        monkeypatch.setattr(
+            runtime,
+            "load_effect_policy",
+            lambda: EffectPolicy(valid=False, error="bad policy"),
+        )
+        popen = MagicMock()
+        monkeypatch.setattr("hermes_cli.bang_shell.subprocess.Popen", popen)
+
+        assert run_bang_command("echo blocked", writer=lambda _line: None) == 126
+        popen.assert_not_called()
+
     def test_output_is_streamed_to_writer(self):
         lines = []
         code = run_bang_command("echo bang-one; echo bang-two", writer=lines.append)

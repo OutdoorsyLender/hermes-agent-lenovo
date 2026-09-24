@@ -1192,6 +1192,8 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    _effect_args: Optional[dict] = None,
+    _effect_tool_call_id: Optional[str] = None,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1210,20 +1212,61 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
-        env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
+        # Pre-exec security checks (tirith + dangerous command detection);
+        # force=True means the user already confirmed.
+        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+
+        from tools.effect_policy import EffectDescriptor, EffectMode, PolicyDecision
+        from tools.effect_policy_runtime import (
+            effect_policy_block_message,
+            effect_policy_error_type,
+            enforce_final_effect_admission,
+        )
+        final_args = _effect_args or {
+            "command": command,
+            "background": background,
+            "timeout": timeout,
+            "workdir": workdir,
+            "pty": pty,
+            "notify_on_complete": notify_on_complete,
+            "watch_patterns": watch_patterns,
+        }
+        final_policy = enforce_final_effect_admission(
+            "terminal",
+            final_args,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=_effect_tool_call_id,
+            effect_descriptor=EffectDescriptor(
+                mode=EffectMode.CONDITIONAL,
+                resolver_key="terminal",
+            ),
+        )
+        if final_policy.decision is not PolicyDecision.ALLOW:
+            raise _Rejected(tool_error(
+                effect_policy_block_message(final_policy)
+                or "Effect policy blocked terminal execution.",
+                error_type=effect_policy_error_type(final_policy),
+                policy_decision=final_policy.decision.value,
+            ))
+
+        env = _acquire_env(plan, task_id)
         # Session key for cwd records: the contextvar doesn't cross tool-worker
         # threads, so fall back to the raw task_id (the top-level agent's
         # session_key) as a stable anchor.
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
-
-        _pre_exec_block(command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key)
-        # Pre-exec security checks (tirith + dangerous command detection);
-        # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        _pre_exec_block(
+            command,
+            env=env,
+            env_type=env_type,
+            cwd=cwd,
+            workdir=workdir,
+            session_key=session_key,
+        )
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
@@ -1265,6 +1308,7 @@ def check_terminal_requirements() -> bool:
         return False
 
 
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry
 
 TERMINAL_SCHEMA = {
@@ -1364,6 +1408,8 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        _effect_args=args,
+        _effect_tool_call_id=kw.get("tool_call_id"),
     )
 
 
@@ -1375,6 +1421,10 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="terminal",
+    ),
 )
 
 
