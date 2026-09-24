@@ -34,7 +34,8 @@ _PROPERTIES: Dict[str, Any] = {
             "focus_app",
         ],
         "description": (
-            "Which action to perform. `capture` is free (no side effects). All other actions "
+            "Which action to perform. `capture`, `wait`, `list_apps`, and `list_windows` are "
+            "non-destructive compatibility actions. All other actions "
             "require approval unless auto-approved. Use `set_value` for select/popup elements and "
             "sliders — it selects the matching option directly without opening the native menu (no "
             "focus steal)."

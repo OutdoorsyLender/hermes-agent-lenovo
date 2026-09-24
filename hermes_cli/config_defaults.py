@@ -1617,6 +1617,16 @@ DEFAULT_CONFIG = {
         # globs on the basename (e.g. "*.mdc").
         "protected_instruction_files": True,
         "protected_instruction_extra_patterns": [],
+        # Phase-1 semantic effect policy. Empty lists preserve existing behavior.
+        # protected_roots must be absolute and applies deny-first filesystem rules;
+        # repository-wide identity is derived only when an entry is a repository root.
+        # opaque process/code carriers require explicit human approval (and deny
+        # unattended execution) whenever a protected root is configured.
+        "effect_policy": {
+            "protected_roots": [],
+            "deny_effects": [],
+            "require_approval_effects": [],
+        },
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

@@ -10,6 +10,7 @@ lazily at call time so ``patch("tools.x.y")`` in tests keeps working.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -111,15 +112,69 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
     )
 
 
-def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
-    result = _call_tool(
-        "tools.memory_tool", "memory_tool", args,
-        (
-            ("action", "action"), ("target", "target", "memory"), ("content", "content"),
-            ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
-        ),
-        store=agent._memory_store,
+def _run_effect_checked_inline(agent, name: str, args: dict, ctx: InlineToolContext, callback):
+    """Consume the outer permit and revalidate immediately before an inline effect."""
+    from tools.effect_policy import PolicyDecision
+    from tools.effect_policy_runtime import (
+        bind_final_effect_admission,
+        consume_effect_permit,
+        effect_policy_block_message,
+        effect_policy_error_type,
+        enforce_final_effect_admission,
     )
+    from tools.registry import registry, tool_error
+
+    identity = registry.snapshot_dispatch_identity(name)
+    permit = consume_effect_permit(
+        name,
+        args,
+        task_id=ctx.effective_task_id,
+        session_id=getattr(agent, "session_id", None),
+        tool_call_id=ctx.tool_call_id,
+        registration_identity=identity,
+    )
+    binding = bind_final_effect_admission(permit) if permit is not None else nullcontext()
+    with binding:
+        result = enforce_final_effect_admission(
+            name,
+            args,
+            task_id=ctx.effective_task_id,
+            session_id=getattr(agent, "session_id", None),
+            tool_call_id=ctx.tool_call_id,
+            effect_descriptor=identity.effect_descriptor if identity is not None else None,
+        )
+        if result.decision is not PolicyDecision.ALLOW:
+            return tool_error(
+                effect_policy_block_message(result) or f"Effect policy blocked {name}",
+                error_type=effect_policy_error_type(result),
+                policy_decision=result.decision.value,
+            )
+        return callback()
+
+
+def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
+    result = _run_effect_checked_inline(
+        agent,
+        "memory",
+        args,
+        ctx,
+        lambda: _call_tool(
+            "tools.memory_tool", "memory_tool", args,
+            (
+                ("action", "action"), ("target", "target", "memory"), ("content", "content"),
+                ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ),
+            store=agent._memory_store,
+        ),
+    )
+    try:
+        policy_blocked = isinstance(result, str) and str(
+            json.loads(result).get("error_type", "")
+        ).startswith("effect_policy_")
+    except (TypeError, ValueError, AttributeError):
+        policy_blocked = False
+    if policy_blocked:
+        return result
     # Mirror built-in memory writes to external providers; gating lives in
     # MemoryManager.notify_memory_tool_write.
     if agent._memory_manager:
@@ -148,6 +203,27 @@ def _desktop_preview(agent, args: dict, ctx: InlineToolContext) -> Any:
     from tools.preview_tool import _handle_preview
 
     return _handle_preview(args)
+
+
+def _setup_mcp(agent, args: dict, ctx: InlineToolContext) -> Any:
+    callback = getattr(agent, "setup_mcp_callback", None)
+    return _run_effect_checked_inline(
+        agent,
+        "setup_mcp",
+        args,
+        ctx,
+        lambda: _call_tool(
+            "tools.setup_mcp_tool",
+            "setup_mcp_tool",
+            args,
+            (
+                ("server", "server", ""),
+                ("action", "action", "install"),
+                ("reason", "reason", ""),
+            ),
+            callback=callback,
+        ),
+    )
 
 
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
@@ -192,10 +268,7 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
         ("action", "action", ""), ("surface", "surface"), ("selector", "selector"), ("title", "title"),
         ("text", "text"), ("side", "side"), ("steps", "steps"), ("step_index", "step_index"),
     ),
-    "setup_mcp": _callback_tool(
-        "tools.setup_mcp_tool", "setup_mcp_tool", "setup_mcp_callback",
-        ("server", "server", ""), ("action", "action", "install"), ("reason", "reason", ""),
-    ),
+    "setup_mcp": _setup_mcp,
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
 }
 

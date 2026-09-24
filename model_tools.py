@@ -648,7 +648,9 @@ def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Opti
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
-            return "error", "tool_error", str(parsed_result.get("error"))
+            error_type = str(parsed_result.get("error_type") or "tool_error")
+            status = "blocked" if error_type.startswith("effect_policy_") else "error"
+            return status, error_type, str(parsed_result.get("error"))
     except Exception:
         pass
     try:
@@ -767,7 +769,10 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            logger.exception("pre_tool_call hook infrastructure failed: %s", _hook_err)
+            block_message = (
+                f"BLOCKED: pre_tool_call plugin infrastructure failed for {function_name}"
+            )
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
@@ -817,11 +822,83 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        # This is the innermost callback after request, execution, and
+        # pre-tool argument rewrites. Direct callers are authorized here; the
+        # agent executor supplies a one-shot permit bound to the same final
+        # arguments after authorizing at its corresponding seam.
+        from tools.effect_policy_runtime import (
+            authorize_and_issue_effect_permit,
+            bind_issued_effect_permit,
+            consume_effect_permit,
+            relay_effect_permit,
+        )
+
+        # Consume the outer permit at this post-middleware seam, then relay a
+        # fresh one-shot permit to the final registry/connector boundary. This
+        # preserves one-shot call identity while letting the final boundary bind
+        # the exact handler or transport.
         from tools.tool_gateway.names import is_connector_name
-        if is_connector_name(function_name):
-            from model_tools_connectors import dispatch_connector_call
-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        connector_tool = is_connector_name(function_name)
+        registration_identity = registry.snapshot_dispatch_identity(function_name)
+        registered_tool = registration_identity is not None
+        final_permit = None
+        consumed = consume_effect_permit(
+            function_name,
+            next_args,
+            task_id=ids.task_id,
+            session_id=ids.session_id,
+            tool_call_id=ids.tool_call_id,
+            registration_identity=(registration_identity if registered_tool else None),
+        )
+        if consumed is None:
+            from tools.effect_policy import PolicyDecision
+            from tools.effect_policy_runtime import effect_policy_block_message, enforce_tool_call
+
+            if registered_tool or connector_tool:
+                policy_result, final_permit = authorize_and_issue_effect_permit(
+                    function_name,
+                    next_args,
+                    task_id=ids.task_id,
+                    session_id=ids.session_id,
+                    tool_call_id=ids.tool_call_id,
+                )
+            else:
+                policy_result = enforce_tool_call(
+                    function_name,
+                    next_args,
+                    task_id=ids.task_id,
+                )
+            if policy_result.decision is not PolicyDecision.ALLOW:
+                stale = "changed during authorization" in policy_result.reason
+                error_type = (
+                    "effect_policy_stale_authorization"
+                    if stale
+                    else (
+                        "effect_policy_denied"
+                        if policy_result.decision is PolicyDecision.DENY
+                        else "effect_policy_approval_required"
+                    )
+                )
+                return tool_error(
+                    effect_policy_block_message(policy_result) or "Effect policy blocked this operation.",
+                    error_type=error_type,
+                    policy_decision=policy_result.decision.value,
+                )
+        elif registered_tool or connector_tool:
+            final_permit = relay_effect_permit(consumed)
+        if connector_tool:
+            with bind_issued_effect_permit(final_permit):
+                from model_tools_connectors import dispatch_connector_call
+                return dispatch_connector_call(
+                    function_name,
+                    next_args,
+                    ids.tool_call_id,
+                    task_id=ids.task_id,
+                    session_id=ids.session_id,
+                )
+        dispatch_kwargs["tool_call_id"] = ids.tool_call_id
+        with bind_issued_effect_permit(final_permit):
+            return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

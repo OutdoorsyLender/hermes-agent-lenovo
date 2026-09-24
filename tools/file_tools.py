@@ -754,7 +754,9 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None,
+                    *, _effect_args: dict | None = None,
+                    _effect_tool_call_id: str | None = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` bypasses the sandbox-mirror lost-write guards only
@@ -783,6 +785,30 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # Per-path lock serializes read→modify→write across concurrent
                 # subagents; different paths stay fully parallel.
                 _lock.enter_context(file_state.lock_path(_resolved))
+            from tools.effect_policy import PolicyDecision
+            from tools.effect_policy_runtime import (
+                effect_policy_block_message,
+                effect_policy_error_type,
+                enforce_final_effect_admission,
+            )
+            final_policy = enforce_final_effect_admission(
+                "write_file",
+                _effect_args or {"path": path, "content": content},
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=_effect_tool_call_id,
+                effect_descriptor=EffectDescriptor(
+                    mode=EffectMode.CONDITIONAL,
+                    resolver_key="write_file",
+                ),
+            )
+            if final_policy.decision is not PolicyDecision.ALLOW:
+                return tool_error(
+                    effect_policy_block_message(final_policy)
+                    or "Effect policy blocked write_file before mutation.",
+                    error_type=effect_policy_error_type(final_policy),
+                    policy_decision=final_policy.decision.value,
+                )
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
             result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
@@ -840,7 +866,8 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
-               session_id: str | None = None) -> str:
+               session_id: str | None = None, *, _effect_args: dict | None = None,
+               _effect_tool_call_id: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
@@ -865,6 +892,38 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
+            from tools.effect_policy import PolicyDecision
+            from tools.effect_policy_runtime import (
+                effect_policy_block_message,
+                effect_policy_error_type,
+                enforce_final_effect_admission,
+            )
+            final_args = _effect_args or {
+                "mode": mode,
+                "path": path,
+                "old_string": old_string,
+                "new_string": new_string,
+                "replace_all": replace_all,
+                "patch": patch,
+            }
+            final_policy = enforce_final_effect_admission(
+                "patch",
+                final_args,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=_effect_tool_call_id,
+                effect_descriptor=EffectDescriptor(
+                    mode=EffectMode.CONDITIONAL,
+                    resolver_key="patch",
+                ),
+            )
+            if final_policy.decision is not PolicyDecision.ALLOW:
+                return tool_error(
+                    effect_policy_block_message(final_policy)
+                    or "Effect policy blocked patch before mutation.",
+                    error_type=effect_policy_error_type(final_policy),
+                    policy_decision=final_policy.decision.value,
+                )
             stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
             file_ops = _get_file_ops(task_id)
 
@@ -1005,6 +1064,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # ---------------------------------------------------------------------------
 # Schemas + Registry
 # ---------------------------------------------------------------------------
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error
 
 
@@ -1200,6 +1260,8 @@ def _handle_write_file(args, **kw):
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        _effect_args=args,
+        _effect_tool_call_id=kw.get("tool_call_id"),
     )
 
 
@@ -1211,6 +1273,8 @@ def _handle_patch(args, **kw):
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        _effect_args=args,
+        _effect_tool_call_id=kw.get("tool_call_id"),
     )
 
 
@@ -1247,8 +1311,8 @@ def _read_file_schema_overrides():
     return {}
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000, dynamic_schema_overrides=_read_file_schema_overrides)
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000, dynamic_schema_overrides=_read_file_schema_overrides, effect_descriptor=EffectDescriptor(mode=EffectMode.READ_ONLY))
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000, effect_descriptor=EffectDescriptor(mode=EffectMode.CONDITIONAL, resolver_key="write_file"))
 def _patch_schema_overrides():
     """Layer the V4A patch mode onto the base replace-only schema for
     OpenAI-family mains (see PATCH_SCHEMA comment). Config/context probe
@@ -1271,8 +1335,8 @@ def _patch_schema_overrides():
         return {}
 
 
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000, dynamic_schema_overrides=_patch_schema_overrides)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000, dynamic_schema_overrides=_patch_schema_overrides, effect_descriptor=EffectDescriptor(mode=EffectMode.CONDITIONAL, resolver_key="patch"))
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000, effect_descriptor=EffectDescriptor(mode=EffectMode.READ_ONLY))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

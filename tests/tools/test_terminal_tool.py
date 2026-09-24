@@ -31,6 +31,49 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "once per session" in description
 
 
+def test_effect_policy_denial_precedes_environment_acquisition(monkeypatch):
+    from types import SimpleNamespace
+
+    from tools import effect_policy_runtime as runtime
+    from tools.effect_policy import PolicyDecision, PolicyResult
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "_plan_execution",
+        lambda *args, **kwargs: SimpleNamespace(
+            env_type="local",
+            cwd="C:/workspace",
+            effective_task_id="task",
+            config={},
+            promoted_from_foreground_timeout=None,
+        ),
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_run_approval_guards",
+        lambda *args, **kwargs: SimpleNamespace(note="", approved_run=False),
+    )
+    acquired = []
+    monkeypatch.setattr(
+        terminal_tool,
+        "_acquire_env",
+        lambda *args, **kwargs: acquired.append(True),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "enforce_final_effect_admission",
+        lambda *args, **kwargs: PolicyResult(
+            PolicyDecision.DENY,
+            "blocked",
+            non_bypassable=True,
+        ),
+    )
+
+    terminal_tool.terminal_tool("echo blocked")
+
+    assert acquired == []
+
+
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)

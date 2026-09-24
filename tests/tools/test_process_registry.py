@@ -135,6 +135,77 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
 
 
+def test_process_tool_rejects_foreign_owner_before_stdin_write(monkeypatch):
+    import tools.process_registry as process_module
+
+    isolated = ProcessRegistry()
+    session = _make_session(sid="proc_owned1234", task_id="container")
+    session.owner_task_id = "owner-a"
+    written = []
+
+    class FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session._pty = FakePty()
+    isolated._running[session.id] = session
+    monkeypatch.setattr(process_module, "process_registry", isolated)
+
+    result = json.loads(process_module._handle_process(
+        {"action": "submit", "session_id": session.id, "data": "danger"},
+        task_id="owner-b",
+    ))
+
+    assert "not owned" in result["error"]
+    assert written == []
+
+
+def test_process_tool_allows_exact_owner_stdin_write(monkeypatch):
+    import tools.process_registry as process_module
+
+    isolated = ProcessRegistry()
+    session = _make_session(sid="proc_owned5678", task_id="container")
+    session.owner_task_id = "owner-a"
+    written = []
+
+    class FakePty:
+        def write(self, value):
+            written.append(value)
+
+    session._pty = FakePty()
+    isolated._running[session.id] = session
+    monkeypatch.setattr(process_module, "process_registry", isolated)
+
+    result = json.loads(process_module._handle_process(
+        {"action": "submit", "session_id": "owned5678", "data": "safe"},
+        task_id="owner-a",
+    ))
+
+    assert result["status"] == "ok"
+    assert written
+
+
+def test_process_tool_direct_policy_denial_is_not_reported_as_stale(monkeypatch):
+    import tools.process_registry as process_module
+    from tools import effect_policy_runtime as runtime
+    from tools.effect_policy import EffectKind, EffectPolicy
+
+    monkeypatch.setattr(
+        runtime,
+        "load_effect_policy",
+        lambda: EffectPolicy(denied_effects=frozenset({EffectKind.PROCESS_EXECUTE})),
+    )
+
+    result = json.loads(
+        process_module._handle_process(
+            {"action": "submit", "session_id": "missing", "data": "x"}
+        )
+    )
+
+    assert result["error_type"] == "effect_policy_denied"
+    assert result["policy_decision"] == "deny"
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout

@@ -359,6 +359,7 @@ def _build_memory_schema_overrides() -> Dict[str, Any]:
     return {"description": description, "parameters": parameters}
 
 
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error  # noqa: E402  (registration at import time)
 
 registry.register(
@@ -370,7 +371,11 @@ registry.register(
         **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
     check_fn=check_memory_requirements,
     emoji="🧠",
-    dynamic_schema_overrides=_build_memory_schema_overrides)
+    dynamic_schema_overrides=_build_memory_schema_overrides,
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="memory",
+    ))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

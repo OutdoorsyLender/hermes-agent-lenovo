@@ -1502,6 +1502,34 @@ class TestResolvePreToolBlock:
 class TestPreToolCallModify:
     """Tests for the modify action — transforming tool args before dispatch."""
 
+    def test_callback_exception_fails_closed_with_block_directive(self):
+        manager = PluginManager()
+
+        def boom(**_kwargs):
+            raise RuntimeError("security plugin crashed")
+
+        manager._hooks["pre_tool_call"] = [boom]
+
+        results = manager.invoke_hook("pre_tool_call", tool_name="write_file", args={})
+
+        assert results
+        assert results[0]["action"] == "block"
+        assert "failed" in results[0]["message"].lower()
+
+    def test_dispatch_infrastructure_failure_fails_closed(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(
+            plugins_mod,
+            "_get_pre_tool_call_directive_details",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        block, modified = plugins_mod._dispatch_pre_tool_call_hooks("write_file", {"path": "x"})
+
+        assert block == "BLOCKED: pre_tool_call plugin infrastructure failed for write_file"
+        assert modified is None
+
     def test_modify_returns_merged_args(self, monkeypatch):
         """A single modify hook should return merged args."""
         monkeypatch.setattr(
@@ -2347,6 +2375,26 @@ class TestPluginDispatchTool:
                     result = ctx.dispatch_tool("web_search", {"query": "test"})
 
         assert result == '{"result": "ok"}'
+
+    def test_dispatch_tool_binds_manager_profile_for_entire_dispatch(self, tmp_path):
+        from hermes_constants import hermes_home_key
+
+        profile_home = tmp_path / "profiles" / "review"
+        profile_home.mkdir(parents=True)
+        mgr = PluginManager(scope_key=str(profile_home))
+        ctx = PluginContext(PluginManifest(name="test-plugin", source="user"), mgr)
+        observed = []
+        mock_registry = MagicMock()
+
+        def dispatch(*args, **kwargs):
+            observed.append(hermes_home_key())
+            return '{"ok": true}'
+
+        mock_registry.dispatch.side_effect = dispatch
+        with patch("tools.registry.registry", mock_registry):
+            ctx.dispatch_tool("web_search", {"query": "test"})
+
+        assert observed == [str(profile_home.resolve()).casefold()]
 
 
     def test_dispatch_tool_respects_explicit_parent_agent(self):

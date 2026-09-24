@@ -7,6 +7,7 @@ from tools.computer_use.schema import COMPUTER_USE_SCHEMA
 from tools.computer_use.tool import (
     check_computer_use_requirements, handle_computer_use, release_computer_use_session, set_approval_callback,
 )
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry
 
 
@@ -22,6 +23,10 @@ registry.register(
         "tool-capable model (Anthropic, OpenAI, OpenRouter, local vLLM, "
         "etc.). Background computer-use: does NOT steal the user's cursor "
         "or keyboard focus."
+    ),
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="computer_use",
     ),
 )
 

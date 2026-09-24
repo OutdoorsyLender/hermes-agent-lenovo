@@ -922,5 +922,34 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         self.assertIn('"token"', src)
 
 
+def test_execute_code_final_admission_preserves_session_id(monkeypatch):
+    import tools.approval as approval
+    import tools.code_execution_tool as code_tool
+    from tools import effect_policy_runtime as runtime
+    from tools.effect_policy import PolicyDecision, PolicyResult
+
+    captured = []
+    monkeypatch.setattr(
+        approval,
+        "check_execute_code_guard",
+        lambda *args, **kwargs: {"approved": True},
+    )
+
+    def deny_final(*args, **kwargs):
+        captured.append(kwargs.get("session_id"))
+        return PolicyResult(PolicyDecision.DENY, "blocked", non_bypassable=True)
+
+    monkeypatch.setattr(runtime, "enforce_final_effect_admission", deny_final)
+
+    code_tool._execute_code_handler(
+        {"code": "print('blocked')"},
+        task_id="task",
+        session_id="session-123",
+        tool_call_id="call",
+    )
+
+    assert captured == ["session-123"]
+
+
 if __name__ == "__main__":
     unittest.main()

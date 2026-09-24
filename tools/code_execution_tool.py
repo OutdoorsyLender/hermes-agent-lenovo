@@ -26,6 +26,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
+from tools.effect_policy import EffectDescriptor, EffectMode
 from tools.registry import registry, tool_error
 
 from hermes_time import get_timezone_name
@@ -494,9 +495,25 @@ def _with_timeout_notice(stdout_text: str, timeout_msg: str) -> str:
     return stdout_text + f"\n\n⏰ {timeout_msg}" if stdout_text else f"⏰ {timeout_msg}"
 
 
-def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0) -> str:
-    return json.dumps({"status": "error", "error": error, "tool_calls_made": tool_calls_made,
-                       "duration_seconds": duration}, ensure_ascii=False)
+def _error_result(
+    error: str,
+    *,
+    tool_calls_made: int = 0,
+    duration: float = 0,
+    error_type: str | None = None,
+    policy_decision: str | None = None,
+) -> str:
+    payload = {
+        "status": "error",
+        "error": error,
+        "tool_calls_made": tool_calls_made,
+        "duration_seconds": duration,
+    }
+    if error_type is not None:
+        payload["error_type"] = error_type
+    if policy_decision is not None:
+        payload["policy_decision"] = policy_decision
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _remote_failure(exc: BaseException, exec_start: float, tool_calls_made: int) -> str:
@@ -662,6 +679,10 @@ def execute_code(
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     reset: bool = False,
+    *,
+    _effect_args: Optional[dict] = None,
+    _effect_session_id: Optional[str] = None,
+    _effect_tool_call_id: Optional[str] = None,
 ) -> str:
     """Run Python in the session's persistent kernel (local) or on the remote terminal backend,
     with RPC access to a subset of Hermes tools; returns the JSON result string. "Sandbox" means
@@ -711,6 +732,31 @@ def execute_code(
     _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
     if not _guard.get("approved", False):
         return _error_result(_guard.get("message") or "execute_code blocked by approval guard.")
+
+    from tools.effect_policy import PolicyDecision
+    from tools.effect_policy_runtime import (
+        effect_policy_block_message,
+        effect_policy_error_type,
+        enforce_final_effect_admission,
+    )
+    final_policy = enforce_final_effect_admission(
+        "execute_code",
+        _effect_args or {"code": code, "reset": bool(reset)},
+        task_id=task_id,
+        session_id=_effect_session_id,
+        tool_call_id=_effect_tool_call_id,
+        effect_descriptor=EffectDescriptor(
+            mode=EffectMode.CONDITIONAL,
+            resolver_key="execute_code",
+        ),
+    )
+    if final_policy.decision is not PolicyDecision.ALLOW:
+        return _error_result(
+            effect_policy_block_message(final_policy)
+            or "Effect policy blocked execute_code before execution.",
+            error_type=effect_policy_error_type(final_policy),
+            policy_decision=final_policy.decision.value,
+        )
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't
     # kill the just-approved run on the first poll. A genuine post-clear interrupt re-sets it.
     if _guard.get("user_approved"):
@@ -892,14 +938,25 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
     if code is not None and not isinstance(code, str):
         return tool_error(f"execute_code received a {type(code).__name__} in 'code', but it "
                           "requires Python source as a string. Retry as execute_code(code=\"...\").")
-    return execute_code(code=code or "", task_id=kwargs.get("task_id"),
-                        enabled_tools=kwargs.get("enabled_tools"), reset=bool(args.get("reset", False)))
+    return execute_code(
+        code=code or "",
+        task_id=kwargs.get("task_id"),
+        enabled_tools=kwargs.get("enabled_tools"),
+        reset=bool(args.get("reset", False)),
+        _effect_args=args,
+        _effect_session_id=kwargs.get("session_id"),
+        _effect_tool_call_id=kwargs.get("tool_call_id"),
+    )
 
 
 registry.register(
     name="execute_code", toolset="code_execution", schema=EXECUTE_CODE_SCHEMA,
     handler=_execute_code_handler, check_fn=check_sandbox_requirements, emoji="🐍",
     max_result_size_chars=100_000,
+    effect_descriptor=EffectDescriptor(
+        mode=EffectMode.CONDITIONAL,
+        resolver_key="execute_code",
+    ),
 )
 
 

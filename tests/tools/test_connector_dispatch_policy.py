@@ -1,8 +1,82 @@
 """Real connector dispatch must run policies against each composed name."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
+
+
+def test_direct_connector_transport_obeys_effect_policy(monkeypatch):
+    from model_tools_connectors import dispatch_connector_call
+    from tools import effect_policy_runtime as runtime
+    from tools.effect_policy import EffectKind, EffectPolicy
+    from tools.tool_gateway import bridge
+
+    monkeypatch.setattr(
+        runtime,
+        "load_effect_policy",
+        lambda: EffectPolicy(denied_effects=frozenset({EffectKind.NETWORK_WRITE})),
+    )
+    remote = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("transport reached"))
+    monkeypatch.setattr(bridge, "run_remote", remote)
+
+    result = json.loads(dispatch_connector_call(
+        "connectors__gmail__SEND_EMAIL",
+        {"to": "x@example.test"},
+        "call-direct",
+    ))
+
+    assert "effect policy" in json.dumps(result).lower()
+
+
+def test_direct_connector_rejects_policy_change_during_approval(monkeypatch):
+    from model_tools_connectors import dispatch_connector_call
+    from tools import effect_policy_runtime as runtime
+    from tools.effect_policy import EffectKind, EffectPolicy
+    from tools.tool_gateway import bridge
+
+    current_policy = {
+        "value": EffectPolicy(
+            approval_required_effects=frozenset({EffectKind.PROCESS_EXECUTE})
+        )
+    }
+    monkeypatch.setattr(runtime, "load_effect_policy", lambda: current_policy["value"])
+
+    def approve_and_tighten(*args, **kwargs):
+        current_policy["value"] = EffectPolicy(
+            denied_effects=frozenset({EffectKind.PROCESS_EXECUTE})
+        )
+        return {"approved": True}
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", approve_and_tighten)
+    calls = []
+    monkeypatch.setattr(
+        bridge,
+        "get_connector_client",
+        lambda: SimpleNamespace(
+            run_remote=lambda **kwargs: calls.append(kwargs) or {"ok": True}
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "run_remote",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True},
+    )
+
+    result = dispatch_connector_call(
+        "connectors__demo__write",
+        {"value": 1},
+        "call-1",
+        task_id="task-1",
+        session_id="session-1",
+    )
+
+    assert json.loads(result)["error_type"] in {
+        "effect_policy_denied",
+        "effect_policy_stale_authorization",
+    }
+    assert calls == []
 
 
 @pytest.mark.parametrize("blocked_by", ["hook", "execution"])
