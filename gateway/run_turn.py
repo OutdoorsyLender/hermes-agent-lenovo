@@ -3766,7 +3766,11 @@ class GatewayTurnMixin:
             try:
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                    # A2A has one pending task for the entire delegated exchange: this
+                    # turn's text precedes a queued follow-up, so it is not its final.
+                    metadata=({**(turn_ctx._status_thread_metadata or {}), "_queued_followup_pending": True}
+                              if turn_ctx.source.platform == "a2a" else turn_ctx._status_thread_metadata),
+                    event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on

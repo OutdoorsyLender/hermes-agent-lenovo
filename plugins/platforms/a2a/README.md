@@ -53,6 +53,15 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+For asynchronous delegation, use v1.0 `SendMessage` with
+`params.configuration.blocking=false`, save the returned Task `id` and
+`contextId`, and poll authenticated `GetTask` by `params.taskId`. The default
+completion bound is 600s from acceptance (`A2A_REPLY_TIMEOUT=300`); cap
+client polling at 620s from submission, then stop and report an unknown or
+failed outcome as appropriate. `a2a_call` does not implement polling.
+See the [sender contract](../../../website/docs/user-guide/messaging/a2a.md#bounded-nonblocking-sender-contract)
+for states, missing acknowledgments, retention, and retry caveats.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to
@@ -83,7 +92,7 @@ via `tasks/get`.
 | `A2A_ALLOW_ALL_USERS` | `false` | Allow any authed peer (dev only). |
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity. |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20). |
-| `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply; the orphan sweep never fails a task before this window (floor 300s) or while a request still waits on it. |
+| `A2A_REPLY_TIMEOUT` | `300` | Blocking-send wait; late nonblocking/working tasks have a separate bounded completion window (default 600s total). |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push signing. |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict skills on the Agent Card. |
 

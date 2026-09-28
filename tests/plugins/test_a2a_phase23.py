@@ -20,6 +20,7 @@ import json
 import socket
 import threading
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
@@ -424,6 +425,268 @@ class TestMetrics:
 
 
 class TestTaskStore:
+    def test_stream_wait_retains_terminal_failure_on_deadline(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        monkeypatch.setattr(mod, "_reply_timeout", lambda: 0.01)
+        pending = {"future": adapter._add_pending("stream", "ctx"), "started": time.time()}
+        state, reply = adapter._await_reply(pending)
+        assert state == protocol.STATE_FAILED
+        assert reply == "[agent did not reply in time]"
+
+    def test_disconnect_terminates_nonblocking_task(self, monkeypatch):
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("shutdown", "ctx", "office")
+        adapter.tasks.set_state("shutdown", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "shutdown", "context_id": "ctx", "peer": "office",
+            "future": adapter._add_pending("shutdown", "ctx"),
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")
+        asyncio.run(adapter.disconnect())
+        assert adapter.tasks.get("shutdown")["state"] == protocol.STATE_FAILED
+        assert "shutdown" not in adapter._late_pending
+
+    @pytest.mark.integration
+    def test_nonblocking_http_queued_child_interim_then_final(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        adapter, base = _make_live_adapter(monkeypatch)
+        interim_sent = asyncio.Event()
+        child_ready = asyncio.Event()
+
+        async def queued_child_reply(event):
+            await adapter.send(event.source.chat_id, "interim", metadata={
+                "notify": True, "_queued_followup_pending": True,
+            })
+            interim_sent.set()
+            await child_ready.wait()
+            await adapter.send(event.source.chat_id, "final after async work", metadata={"notify": True})
+
+        adapter.handle_message = queued_child_reply
+
+        async def run():
+            assert await adapter.connect() is True
+            try:
+                request = _send_body("work", ctx="ctx-nonblocking")
+                request["method"] = "SendMessage"
+                request["params"]["configuration"] = {"blocking": False}
+                response = await asyncio.to_thread(_post_json, base + "/", request)
+                task = response["result"]["task"]
+                assert task["status"]["state"] == protocol.STATE_WORKING
+                await asyncio.wait_for(interim_sent.wait(), timeout=2)
+                # If the submission response were lost, the unique context can
+                # locate candidates without submitting a duplicate task.
+                listed = await asyncio.to_thread(_post_json, base + "/", {
+                    "jsonrpc": "2.0", "id": "recover", "method": "ListTasks",
+                    "params": {"contextId": "ctx-nonblocking"},
+                })
+                assert [item["id"] for item in listed["result"]["tasks"]] == [task["id"]]
+                first_poll = await asyncio.to_thread(_post_json, base + "/", {
+                    "jsonrpc": "2.0", "id": "first-poll", "method": "tasks/get",
+                    "params": {"taskId": task["id"]},
+                })
+                assert first_poll["result"]["status"]["state"] == protocol.STATE_WORKING
+                child_ready.set()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    fetched = await asyncio.to_thread(_post_json, base + "/", {
+                        "jsonrpc": "2.0", "id": "2", "method": "tasks/get",
+                        "params": {"taskId": task["id"]},
+                    })
+                    if fetched["result"]["status"]["state"] == protocol.STATE_COMPLETED:
+                        assert protocol.extract_text(fetched["result"]["artifacts"][0]) == "final after async work"
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("task did not transition to completed")
+            finally:
+                child_ready.set()
+                await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_nonblocking_dispatch_does_not_spawn_one_waiter_thread_per_task(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        spawned = []
+        monkeypatch.setattr(mod, "_daemon_thread", lambda *args: spawned.append(args))
+        for i in range(12):
+            tid = f"task-{i}"
+            rec = adapter.tasks.create(tid, "ctx", "office")
+            adapter.tasks.set_state(tid, protocol.STATE_WORKING)
+            pending = {
+                "task_id": tid, "context_id": "ctx", "peer": "office",
+                "future": adapter._add_pending(tid, "ctx"),
+                "created_iso": rec["created_iso"], "started": time.time(),
+            }
+            monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+            assert adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")["result"]["status"]["state"] == protocol.STATE_WORKING
+        assert spawned == []
+
+    def test_nonblocking_task_fails_after_bounded_deadline(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("stalled", "ctx", "office")
+        adapter.tasks.set_state("stalled", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "stalled", "context_id": "ctx", "peer": "office",
+            "future": adapter._add_pending("stalled", "ctx"),
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+        monkeypatch.setattr(mod, "_orphan_timeout", lambda: 0.03)
+        monkeypatch.setattr(mod, "_reply_timeout", lambda: 0.01)
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._watchdog_thread = threading.Thread(target=adapter._watchdog_loop, daemon=True)
+        adapter._watchdog_thread.start()
+        response = adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")
+        assert response["result"]["status"]["state"] == protocol.STATE_WORKING
+        deadline = time.monotonic() + 2
+        while adapter.tasks.get("stalled")["state"] != protocol.STATE_FAILED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert adapter.tasks.get("stalled")["state"] == protocol.STATE_FAILED
+        assert "stalled" not in adapter._active_tasks
+        adapter._watchdog_stop.set()
+        adapter._late_wakeup.set()
+        adapter._watchdog_thread.join(timeout=1)
+
+    def test_reply_after_deadline_fails_even_if_watchdog_has_not_run(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("late-expired", "ctx", "office")
+        adapter.tasks.set_state("late-expired", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "late-expired", "context_id": "ctx", "peer": "office",
+            "future": adapter._add_pending("late-expired", "ctx"),
+            "created_iso": rec["created_iso"], "started": time.time() - 2,
+        }
+        monkeypatch.setattr(mod, "_orphan_timeout", lambda: 1)
+        monkeypatch.setattr(mod, "_reply_timeout", lambda: 0.5)
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")
+
+        # The reply arrived past the deadline but ahead of the next watchdog tick.
+        asyncio.run(adapter.send("ctx", "too late", metadata={"notify": True}))
+        adapter._finish_due_late_pending()
+        assert adapter.tasks.get("late-expired")["state"] == protocol.STATE_FAILED
+        assert adapter.tasks.get("late-expired")["reply"] == "[agent did not reply in time]"
+
+    def test_reply_before_deadline_survives_delayed_watchdog(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("late-observed", "ctx", "office")
+        adapter.tasks.set_state("late-observed", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "late-observed", "context_id": "ctx", "peer": "office",
+            "future": adapter._add_pending("late-observed", "ctx"),
+            "created_iso": rec["created_iso"], "started": time.time() - 0.8,
+        }
+        monkeypatch.setattr(mod, "_orphan_timeout", lambda: 1)
+        monkeypatch.setattr(mod, "_reply_timeout", lambda: 0.5)
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")
+
+        asyncio.run(adapter.send("ctx", "on time", metadata={"notify": True}))
+        time.sleep(0.25)  # Delay only the watchdog, not the agent response.
+        adapter._finish_due_late_pending()
+        assert adapter.tasks.get("late-observed")["state"] == protocol.STATE_COMPLETED
+        assert adapter.tasks.get("late-observed")["reply"] == "on time"
+
+    def test_explicit_nonblocking_send_returns_working_without_waiting(self, monkeypatch):
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("nonblocking", "ctx", "office")
+        adapter.tasks.set_state("nonblocking", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "nonblocking", "context_id": "ctx", "peer": "office",
+            "future": adapter._add_pending("nonblocking", "ctx"),
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._watchdog_thread = threading.Thread(target=adapter._watchdog_loop, daemon=True)
+        adapter._watchdog_thread.start()
+        start = time.monotonic()
+        result = adapter._rpc_message_send(1, {"configuration": {"blocking": False}}, "office")
+        assert time.monotonic() - start < 1
+        assert result["result"]["status"]["state"] == protocol.STATE_WORKING
+        asyncio.run(adapter.send("ctx", "done", metadata={"notify": True}))
+        deadline = time.monotonic() + 2
+        while adapter.tasks.get("nonblocking")["state"] != protocol.STATE_COMPLETED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert adapter.tasks.get("nonblocking")["reply"] == "done"
+        adapter._watchdog_stop.set()
+        adapter._late_wakeup.set()
+        adapter._watchdog_thread.join(timeout=1)
+
+    def test_queued_followup_marks_only_a2a_first_response_as_interim(self):
+        from gateway.run_turn import GatewayTurnMixin
+
+        async def deliver_for(platform):
+            captured = []
+            runner = SimpleNamespace(
+                _run_agent_stream_confirmed_final_delivery=lambda *_args, **_kwargs: False,
+                _is_intentional_silence=lambda *_args: False,
+                _deliver_queued_first_response=lambda *args, **kwargs: capture(kwargs),
+                _pop_post_delivery_callback=lambda *_args: None,
+            )
+
+            async def capture(kwargs):
+                captured.append(kwargs["metadata"])
+                return True
+
+            ctx = SimpleNamespace(
+                mute_notification_reply=False, session_key="session", stream_consumer_holder=[None],
+                source=SimpleNamespace(platform=platform), _status_thread_metadata={"thread": "x"},
+                event_message_id="id", inbound_message_id="id", run_generation=1,
+            )
+            await GatewayTurnMixin._run_agent_deliver_first_response(
+                runner, ctx, object(), {"final_response": "interim"}, {}, None)
+            return captured[0]
+
+        assert asyncio.run(deliver_for("a2a")) == {"thread": "x", "_queued_followup_pending": True}
+        assert asyncio.run(deliver_for("telegram")) == {"thread": "x"}
+
+    def test_reply_deadline_returns_working_and_preserves_late_final(self, monkeypatch):
+        from plugins.platforms.a2a import adapter as mod
+
+        adapter, _ = _make_live_adapter(monkeypatch)
+        rec = adapter.tasks.create("late", "ctx-late", "office")
+        adapter.tasks.set_state("late", protocol.STATE_WORKING)
+        pending = {
+            "task_id": "late", "context_id": "ctx-late", "peer": "office",
+            "future": adapter._add_pending("late", "ctx-late"),
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
+        monkeypatch.setattr(mod, "_reply_timeout", lambda: 0.01)
+        monkeypatch.setattr(adapter, "_prepare_task", lambda *_args, **_kwargs: (None, pending))
+        adapter._watchdog_thread = threading.Thread(target=adapter._watchdog_loop, daemon=True)
+        adapter._watchdog_thread.start()
+        response = adapter._rpc_message_send(1, {}, "office")["result"]
+        assert response["status"]["state"] == protocol.STATE_WORKING
+        assert adapter.tasks.get("late")["state"] == protocol.STATE_WORKING
+
+        asyncio.run(adapter.send("ctx-late", "the final answer", metadata={"notify": True}))
+        deadline = time.monotonic() + 2
+        while adapter.tasks.get("late")["state"] != protocol.STATE_COMPLETED and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert adapter.tasks.get("late")["state"] == protocol.STATE_COMPLETED
+        assert adapter.tasks.get("late")["reply"] == "the final answer"
+        adapter._watchdog_stop.set()
+        adapter._late_wakeup.set()
+        adapter._watchdog_thread.join(timeout=1)
+
+    def test_queued_followup_first_send_is_not_task_final(self, monkeypatch):
+        adapter, _ = _make_live_adapter(monkeypatch)
+        adapter._add_pending("late", "ctx-late")
+        asyncio.run(adapter.send("ctx-late", "interim", metadata={"notify": True, "_queued_followup_pending": True}))
+        assert not adapter._pending["late"][1].done()
+
 
 
     def test_complete_is_idempotent(self):

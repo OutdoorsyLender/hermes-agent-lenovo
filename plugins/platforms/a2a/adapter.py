@@ -285,6 +285,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_thread = self._watchdog_thread = None  # type: Optional[threading.Thread]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._watchdog_stop = threading.Event()
+        self._late_wakeup = threading.Event()
         # Per-adapter protocol state (not module-global).
         self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
         # Forwarded profile sessions: (profile, agent_slug, context_id) -> session_id.
@@ -295,6 +296,7 @@ class A2AAdapter(BasePlatformAdapter):
         # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
+        self._late_pending: Dict[str, tuple[dict, float]] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
         self._pending_lock = threading.Lock()
@@ -326,6 +328,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._httpd.adapter = self  # type: ignore[attr-defined]
         self._server_thread = _daemon_thread(self._httpd.serve_forever, "a2a-http")
         self._watchdog_stop.clear()  # disconnect sets it; reset for reconnection
+        self._late_wakeup.clear()
         self._watchdog_thread = _daemon_thread(self._watchdog_loop, "a2a-watchdog")
         self._mark_connected()
         logger.info("A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)", self.host, self.port,
@@ -336,6 +339,7 @@ class A2AAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
         self._watchdog_stop.set()
+        self._late_wakeup.set()
         if self._httpd is not None:
             with contextlib.suppress(Exception):
                 self._httpd.shutdown()
@@ -343,19 +347,49 @@ class A2AAdapter(BasePlatformAdapter):
             self._httpd = None
         # Fail any in-flight replies so blocked HTTP threads don't hang.
         with self._pending_lock:
+            late = [pending for pending, _deadline in self._late_pending.values()]
             for tid in list(self._pending):
                 self._resolve_locked(tid, protocol.STATE_FAILED, "[agent shutting down]")
             self._pending.clear()
             self._pending_order.clear()
             self._active_tasks.clear()
+            self._late_pending.clear()
+        for pending in late:
+            self._finalize_task(pending, protocol.STATE_FAILED, "[agent shutting down]")
 
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
-        while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
+        while not self._watchdog_stop.is_set():
+            self._late_wakeup.wait(1.0 if self._late_pending else _WATCHDOG_INTERVAL)
+            self._late_wakeup.clear()
+            if self._watchdog_stop.is_set():
+                break
             try:
+                self._finish_due_late_pending()
                 self._fail_orphans_once()
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
+
+    def _finish_due_late_pending(self) -> None:
+        """Use the existing single watchdog instead of a waiting thread per task."""
+        with self._pending_lock:
+            candidates = list(self._late_pending.items())
+        for task_id, (pending, deadline) in candidates:
+            future = pending["future"]
+            if not future.done() and time.time() < deadline:
+                continue
+            with self._pending_lock:
+                if self._late_pending.pop(task_id, None) is None:
+                    continue
+            # A watchdog tick can run after the deadline; judge the reply by
+            # when it resolved, not when the watchdog happened to observe it.
+            on_time = future.done() and getattr(future, "_a2a_resolved_at", time.time()) <= deadline
+            state, reply = (future.result() if on_time else
+                            (protocol.STATE_FAILED, "[agent did not reply in time]"))
+            try:
+                self._finalize_task(pending, state, reply)
+            except Exception:
+                logger.exception("A2A: late finalization failed for %s", task_id)
 
     def _fail_orphans_once(self) -> list[str]:
         """Fail stale tasks that no request still owns."""
@@ -501,6 +535,7 @@ class A2AAdapter(BasePlatformAdapter):
         entry = self._pending.get(task_id)
         if not entry or entry[1].done():
             return False
+        entry[1]._a2a_resolved_at = time.time()
         entry[1].set_result((state, text))
         return True
 
@@ -656,14 +691,32 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
+    def _await_reply(self, pending: dict, keepalive=None, *, return_working: bool = False) -> tuple[str, str]:
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
+                                  (protocol.STATE_WORKING, "") if return_working else
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
+
+    def _register_late_reply(self, pending: dict) -> None:
+        """Retain a task for a bounded time; wake the shared watchdog on completion."""
+        deadline = pending["started"] + min(
+            _MAX_ORPHAN_TIMEOUT, max(_orphan_timeout(), 2 * _reply_timeout()))
+        with self._pending_lock:
+            self._late_pending[pending["task_id"]] = (pending, deadline)
+        pending["future"].add_done_callback(lambda _future: self._late_wakeup.set())
+        self._late_wakeup.set()
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
+            # A2A's explicit nonblocking mode gives callers a task ID to poll without
+            # holding their HTTP connection across an async delegation.
+            config = params.get("configuration") or {}
+            nonblocking = isinstance(config, dict) and config.get("blocking") is False
+            state, reply = (protocol.STATE_WORKING, "") if nonblocking else self._await_reply(pending, return_working=True)
+            if state == protocol.STATE_WORKING:
+                self._register_late_reply(pending)
+            else:
+                state, reply = self._finalize_task(pending, state, reply)
             task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
@@ -829,7 +882,7 @@ class A2AAdapter(BasePlatformAdapter):
         """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
         Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
         the caller; progress/status/preview sends must not."""
-        if not (metadata or {}).get("notify"):
+        if not (metadata or {}).get("notify") or (metadata or {}).get("_queued_followup_pending"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
         elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
             logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band

@@ -77,6 +77,20 @@ Inbound tasks are injected into a **live gateway session** — the same agent, m
 
 Interoperability is verified against the official Python `a2a-sdk` (card resolution, `SendMessage`, streaming).
 
+### Bounded nonblocking sender contract
+
+For a task that may spawn an asynchronous child, the caller must support A2A task polling; Hermes's `a2a_call` tool currently sends a blocking `SendMessage` and **does not poll**. A compatible sender authenticates each JSON-RPC POST to the Agent Card's JSON-RPC URL and submits once:
+
+```json
+{"jsonrpc":"2.0","id":"request-1","method":"SendMessage","params":{"message":{"messageId":"message-1","contextId":"unique-attempt-context","role":"ROLE_USER","parts":[{"text":"Bounded task instructions"}]},"configuration":{"blocking":false}}}
+```
+
+The v1.0 response carries a Task in `result.task` (legacy aliases can return a bare Task in `result`), initially `TASK_STATE_WORKING`. Save **both** its server-generated `id` (the `taskId`) and `contextId`; the JSON-RPC `id` and Message `messageId` are not task IDs or idempotency keys. Poll `{"jsonrpc":"2.0","id":"poll-1","method":"GetTask","params":{"taskId":"<returned-task-id>"}}` on the same authenticated endpoint and scope, at a bounded interval (for example every 2–5 seconds). `TASK_STATE_SUBMITTED` and `TASK_STATE_WORKING` mean continue polling. `TASK_STATE_COMPLETED` means read the final `artifacts` and stop; `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, and `TASK_STATE_REJECTED` mean stop and report that outcome. Treat `TASK_STATE_INPUT_REQUIRED` as a prompt for an explicit subsequent turn on the returned context, **not** as a successful final result. A queued-follow-up interim text is not the task's final artifact.
+
+With the default `A2A_REPLY_TIMEOUT=300`, the nonblocking task is bounded to 600 seconds from acceptance (the larger of the orphan grace and twice the reply window, capped at 86400 seconds). The sender should cap its **overall** polling at 620 seconds from submission to allow for the watchdog tick, and use a separate short timeout for each HTTP request; an operator must align that bound if the receiver's configured reply window differs. At the bound, a still-unanswered task becomes `TASK_STATE_FAILED`; a late agent reply cannot turn it into a successful A2A delivery. Completed/failed Task records are in memory, with only the newest 500 terminal records retained; they are not durable across a gateway restart. `GetTask` not-found after eviction or restart is **unknown outcome**, not proof the request never ran.
+
+If the submission reached the receiver but the HTTP acknowledgment was lost, do **not** blindly re-submit. Query `ListTasks` with `params.contextId` set to the unique attempt context (page through `nextPageToken` if needed), reconcile the returned task ID and status, or escalate for audit/session correlation when no unique task can be established. The server generates a new task for each `SendMessage`; neither `messageId` nor `contextId` deduplicates retries. Listing may be ambiguous or unavailable after restart, so this protocol offers **no exactly-once execution guarantee**.
+
 ## Security model
 
 Secure by default; every widening step is explicit:
@@ -102,7 +116,7 @@ Secure by default; every widening step is explicit:
 | `A2A_ALLOW_ALL_USERS` | `false` | Allow any authenticated peer (dev only) |
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20) |
-| `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply. The orphan-task sweep never fails a task before this window elapses (floor 300s), and never while a request is still waiting on it |
+| `A2A_REPLY_TIMEOUT` | `300` | Blocking `SendMessage` HTTP wait. An unanswered send returns a working Task for polling; nonblocking tasks have a separate bounded completion window as described above. Streaming sends retain their terminal timeout behavior. |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push-notification signing |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict which skills appear on the Agent Card |
 
@@ -127,4 +141,4 @@ curl -X POST http://your-host:9900/ \
 - **Peers can't reach the card URL** — the card was advertising your bind address; set `A2A_PUBLIC_URL` to the externally routable URL.
 - **`401 Unauthorized`** — token mismatch; check `A2A_PEER_TOKENS`/`A2A_BEARER_TOKEN` on the server and the peer's `auth:` block.
 - **Server won't bind non-localhost** — by design: set a bearer token first, then `A2A_HOST=0.0.0.0`.
-- **Replies time out on long tasks** — raise `A2A_REPLY_TIMEOUT` (the orphan sweep follows it, so a late reply is stored, not discarded), or have the caller register a push-notification config and poll `GetTask`.
+- **Replies time out on long tasks** — use `configuration.blocking=false` and poll `GetTask` within the bounded window above. Merely raising the blocking timeout can still lose a queued-child final or exceed the caller's own HTTP deadline.
