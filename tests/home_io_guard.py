@@ -32,6 +32,37 @@ _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
 
+@lru_cache(maxsize=8)
+def _path_root_prefixes(entries: tuple) -> tuple:
+    """Directories on sys.path (distribution search roots), normalized.
+
+    importlib.metadata stats every distribution search root it walks (FastPath.mtime
+    does os.stat(root)). A venv .pth can put the INSTALLED checkout on sys.path,
+    which makes that stat land inside the real hermes home — the interpreter enumerating its
+    own installation, not Hermes state. Keyed on the entries so a test that patches
+    sys.path sees the change.
+    """
+    roots = []
+    for entry in entries:
+        if not entry:
+            continue
+        try:
+            if os.path.isdir(entry):
+                roots.append(_normcase(os.path.abspath(entry)))
+        except OSError:  # an unreadable entry is not a search root we can vouch for
+            continue
+    return tuple(dict.fromkeys(roots))
+
+
+_DIST_METADATA_SUFFIXES = (".dist-info", ".egg-info")
+
+
+def _under_dist_metadata(absolute: str) -> bool:
+    """Whether a normalized absolute path is inside a ``*.dist-info``/``*.egg-info`` directory:
+    the only files ``importlib.metadata`` reads while discovering an installation."""
+    return any(part.endswith(_DIST_METADATA_SUFFIXES) for part in absolute.split(os.sep))
+
+
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
     if path == prefix:
@@ -93,6 +124,19 @@ class HomeIOGuard:
                 path = os.environ.get("PATH", "")
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
                 if os.path.dirname(absolute) in self._path_entries(path, cwd):
+                    return
+            # Distribution discovery: while ``importlib.metadata`` enumerates
+            # installations it stats each ``sys.path`` search root (``FastPath.mtime``) and reads
+            # that distribution's metadata files (``entry_points.txt``, ``METADATA``). A venv
+            # ``.pth`` that puts the installed checkout on ``sys.path`` makes both land inside the
+            # real hermes home: the interpreter describing its own installation, not reading
+            # Hermes state. Allowed: metadata stats, and read-only opens of ``*.dist-info`` /
+            # ``*.egg-info`` entries. Writes, deletes and any other read under the root are still
+            # refused below.
+            for prefix in _path_root_prefixes(tuple(sys.path)):
+                if not _within(absolute, prefix):
+                    continue
+                if metadata or (not destructive and _under_dist_metadata(absolute)):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
