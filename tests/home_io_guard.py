@@ -47,10 +47,17 @@ def _path_root_prefixes(entries: tuple) -> tuple:
         if not entry:
             continue
         try:
-            if os.path.isdir(entry):
-                roots.append(_normcase(os.path.abspath(entry)))
+            if not os.path.isdir(entry):
+                continue
+            lexical = _normcase(os.path.abspath(entry))
+            resolved = _normcase(os.path.realpath(entry))
         except OSError:  # an unreadable entry is not a search root we can vouch for
             continue
+        if lexical != resolved:
+            # A search root that is a link could name a tree outside what it appears to be;
+            # granting access through it would slip past the real-root boundary below.
+            continue
+        roots.append(lexical)
     return tuple(dict.fromkeys(roots))
 
 
@@ -58,9 +65,18 @@ _DIST_METADATA_SUFFIXES = (".dist-info", ".egg-info")
 
 
 def _under_dist_metadata(absolute: str) -> bool:
-    """Whether a normalized absolute path is inside a ``*.dist-info``/``*.egg-info`` directory:
-    the only files ``importlib.metadata`` reads while discovering an installation."""
-    return any(part.endswith(_DIST_METADATA_SUFFIXES) for part in absolute.split(os.sep))
+    """Whether a normalized absolute path is inside a real ``*.dist-info``/``*.egg-info``
+    *directory*: the only files ``importlib.metadata`` reads while discovering an installation.
+
+    The matching component must actually be a directory, so a regular file that merely ends in
+    ``.egg-info`` does not qualify. ``os.path.isdir`` here re-enters ``check`` only to be skipped
+    by the re-entrancy latch, so it cannot recurse.
+    """
+    parts = [part for part in absolute.split(os.sep) if part]
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index].endswith(_DIST_METADATA_SUFFIXES):
+            return os.path.isdir(os.sep.join(parts[: index + 1]))
+    return False
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -136,7 +152,12 @@ class HomeIOGuard:
             for prefix in _path_root_prefixes(tuple(sys.path)):
                 if not _within(absolute, prefix):
                     continue
-                if metadata or (not destructive and _under_dist_metadata(absolute)):
+                # A stat of the search root ITSELF is what FastPath.mtime does; nothing deeper is
+                # allowed by that clause, so state inside the root stays probe-proof.
+                if metadata and absolute == prefix:
+                    return
+                # Discovery of that distribution's metadata directory, read-only.
+                if _under_dist_metadata(absolute) and (metadata or not destructive):
                     return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
